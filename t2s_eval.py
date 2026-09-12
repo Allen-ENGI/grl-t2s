@@ -13,7 +13,7 @@ be conflated:
      stronger and more meaningful test and is what run_full_evaluation
      focuses on.
 
-Metrics, defined explicitly:
+Metrics, defined explicitly (spec asked for this):
   - MAE (mean absolute error): mean(|prediction - true_steps_remaining|),
     in the same units as steps_remaining (frames). Robust to outliers,
     easy to interpret ("predictions are off by N frames on average").
@@ -148,4 +148,77 @@ def run_full_evaluation(predict_fn, eval_success_policy, eval_failure_policy,
         unexpected_success_rate=float(np.mean([r["succeeded_unexpectedly"] for r in report["failure_scenario"]])),
     )
     return report
+
+
+def plot_combo_comparison(reports, metrics=("mae", "rmse", "spearman_rho", "max_wrong_direction"),
+                           save_path=None):
+    """
+    Bar chart comparing every combo (e.g. mc_succ, td0_succ, ...) across the
+    given metrics, one subplot per metric. Reads reports[combo]['success_scenario_summary'].
+    Skips a metric entirely if no combo has it (e.g. correlation undefined for
+    degenerate predictions) rather than plotting an empty/misleading panel.
+    """
+    import matplotlib.pyplot as plt
+
+    combos = list(reports.keys())
+    available_metrics = [
+        m for m in metrics
+        if any(m in reports[c].get("success_scenario_summary", {}) for c in combos)
+    ]
+    if not available_metrics:
+        raise ValueError("none of the requested metrics are present in any report's success_scenario_summary")
+
+    fig, axes = plt.subplots(1, len(available_metrics), figsize=(5 * len(available_metrics), 4))
+    if len(available_metrics) == 1:
+        axes = [axes]
+
+    for ax, metric in zip(axes, available_metrics):
+        values = [reports[c].get("success_scenario_summary", {}).get(metric, np.nan) for c in combos]
+        bars = ax.bar(combos, values, color="tab:blue")
+        # highlight the best combo for this metric (lower is better, except correlations)
+        higher_is_better = metric in ("pearson_r", "spearman_rho")
+        finite = [v for v in values if not np.isnan(v)]
+        if finite:
+            best_val = max(finite) if higher_is_better else min(finite)
+            for bar, v in zip(bars, values):
+                if v == best_val:
+                    bar.set_color("tab:green")
+        ax.set_title(metric)
+        ax.set_xticklabels(combos, rotation=45, ha="right")
+        ax.axhline(0, color="gray", lw=0.5)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return fig
+
+
+def format_report_table(reports, metrics=("mae", "rmse", "pearson_r", "spearman_rho", "max_wrong_direction")):
+    """
+    Pure-string comparison table across combos and metrics — no matplotlib,
+    so this is unit-testable and also useful for logging/console output
+    where a plot isn't practical. Returns the table as a single string;
+    print it yourself (kept as a pure function rather than printing directly
+    so it's testable and reusable for writing to a log file).
+    """
+    combos = list(reports.keys())
+    available_metrics = [
+        m for m in metrics
+        if any(m in reports[c].get("success_scenario_summary", {}) for c in combos)
+    ]
+    if not available_metrics:
+        return "(no metrics available in any report's success_scenario_summary)"
+
+    col_w = 14
+    header = f"{'combo':<16}" + "".join(f"{m:>{col_w}}" for m in available_metrics)
+    lines = [header, "-" * len(header)]
+    for c in combos:
+        summary = reports[c].get("success_scenario_summary", {})
+        row = f"{c:<16}"
+        for m in available_metrics:
+            v = summary.get(m)
+            row += f"{v:>{col_w}.4f}" if v is not None else f"{'--':>{col_w}}"
+        lines.append(row)
+    return "\n".join(lines)
 
