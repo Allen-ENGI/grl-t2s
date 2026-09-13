@@ -45,16 +45,25 @@ class SuccessRateCallback(BaseCallback):
         self.history = []
 
     def _run_eval_episode(self):
+        """
+        Returns (success_step|None, progress_metrics_dict).
+        Progress metrics are model-independent (peg-to-goal distance, control
+        onset) so runs that all score 0% success can still be ranked — see
+        progress.py for why cumulative shaped reward cannot serve this role.
+        """
+        from progress import compute_progress_metrics
+
         obs, _ = self.eval_env.reset()
-        success_step = None
+        obs_list, success_step = [], None
         for t in range(self.max_ep_steps):
+            obs_list.append(np.asarray(obs, dtype=np.float32).copy())
             action, _ = self.model.predict(obs, deterministic=True)
             obs, _reward, terminated, truncated, info = self.eval_env.step(action)
             if info.get(SUCCESS_KEY, 0) and success_step is None:
                 success_step = t
             if terminated or truncated:
                 break
-        return success_step
+        return success_step, compute_progress_metrics(np.array(obs_list), success_step)
 
     def _on_step(self) -> bool:
         # Use num_timesteps (total ENVIRONMENT steps across all parallel envs),
@@ -73,7 +82,12 @@ class SuccessRateCallback(BaseCallback):
                 print(f"[ckpt] saved {path}")
 
         if self.num_timesteps % self.eval_freq < n_envs:
-            success_steps = [self._run_eval_episode() for _ in range(self.n_eval_episodes)]
+            from progress import aggregate_progress_metrics
+
+            results = [self._run_eval_episode() for _ in range(self.n_eval_episodes)]
+            success_steps = [s for s, _m in results]
+            progress = aggregate_progress_metrics([m for _s, m in results])
+
             success_rate = sum(s is not None for s in success_steps) / self.n_eval_episodes
             times = [s for s in success_steps if s is not None]
             mean_t2s = float(np.mean(times)) if times else None
@@ -81,14 +95,30 @@ class SuccessRateCallback(BaseCallback):
             self.logger.record("eval/success_rate", success_rate)
             if mean_t2s is not None:
                 self.logger.record("eval/mean_time_to_success", mean_t2s)
+            # model-independent progress, logged so TensorBoard shows movement
+            # even while success_rate is pinned at zero
+            for key in ("mean_min_hand_peg_distance", "best_min_hand_peg_distance",
+                         "mean_min_peg_goal_distance", "best_min_peg_goal_distance",
+                         "mean_final_peg_goal_distance", "peg_moved_rate",
+                         "control_rate", "mean_obs_movement"):
+                if progress.get(key) is not None:
+                    self.logger.record(f"eval/{key}", progress[key])
 
-            self.history.append(dict(step=self.num_timesteps, success_rate=success_rate,
-                                      mean_time_to_success=mean_t2s,
-                                      raw_time_to_success=success_steps, timestamp=time.time()))
+            entry = dict(step=self.num_timesteps, success_rate=success_rate,
+                          mean_time_to_success=mean_t2s,
+                          raw_time_to_success=success_steps, timestamp=time.time())
+            entry.update(progress)
+            self.history.append(entry)
             with open(os.path.join(self.ckpt_dir, "eval_history.json"), "w") as f:
                 json.dump(self.history, f, indent=2)
             if self.verbose:
-                print(f"[eval @ {self.num_timesteps}] success_rate={success_rate:.2f} mean_t2s={mean_t2s}")
+                hd = progress.get("mean_min_hand_peg_distance")
+                pd = progress.get("mean_min_peg_goal_distance")
+                print(f"[eval @ {self.num_timesteps}] succ={success_rate:.2f} "
+                      f"hand->peg={f'{hd:.4f}' if hd is not None else '--'} "
+                      f"peg->goal={f'{pd:.4f}' if pd is not None else '--'} "
+                      f"peg_moved={progress.get('peg_moved_rate')} "
+                      f"ctrl={progress.get('control_rate')}")
         return True
 
 

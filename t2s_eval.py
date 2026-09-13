@@ -194,6 +194,107 @@ def plot_combo_comparison(reports, metrics=("mae", "rmse", "spearman_rho", "max_
     return fig
 
 
+def collect_eval_trajectories(eval_success_policy, eval_failure_policy, seed=500, max_steps=500,
+                               stop_after_success=CONFIRM_BUFFER_DEFAULT):
+    """
+    Rolls out exactly TWO reference trajectories — one from the held-out
+    success policy, one from the held-out failure policy — and returns their
+    raw observations plus ground truth.
+
+    Deliberately separated from prediction: the observations are collected
+    ONCE, then every model predicts on these same stored states (see
+    plot_sample_trajectories). If each model rolled out its own trajectory,
+    differences between the prediction curves would be confounded by
+    differences in the trajectories themselves, and the comparison would be
+    meaningless.
+
+    Returns {"success": traj, "failure": traj} where traj is a dict with
+    "obs" (T, obs_dim), "success_step" (int|None), "truth" (T,) or None.
+    """
+    from env_utils import make_fixed_scene_env
+
+    def _roll(policy, seed):
+        env = make_fixed_scene_env()
+        obs, _ = env.reset(seed=seed)
+        obs_list, success_step = [], None
+        for t in range(max_steps):
+            obs_list.append(obs.copy())
+            action, _ = policy.predict(obs, deterministic=True)
+            obs, _r, term, trunc, info = env.step(action)
+            if info.get(SUCCESS_KEY, 0) and success_step is None:
+                success_step = t
+            if success_step is not None and t >= success_step + stop_after_success:
+                break
+            if term or trunc:
+                break
+        env.close()
+        obs_arr = np.array(obs_list, dtype=np.float32)
+        truth = (np.array([max(0, success_step - t) for t in range(len(obs_arr))], dtype=np.float32)
+                 if success_step is not None else None)
+        return dict(obs=obs_arr, success_step=success_step, truth=truth)
+
+    return {
+        "success": _roll(eval_success_policy, seed),
+        "failure": _roll(eval_failure_policy, seed),
+    }
+
+
+def plot_sample_trajectories(trajectories, predictors, save_path=None, censor_label=300.0):
+    """
+    Two side-by-side panels (success trajectory, failure trajectory), with
+    EVERY model's prediction overlaid on the same states, plus ground truth.
+
+    trajectories: output of collect_eval_trajectories.
+    predictors: {combo_name: predict_fn} — each predict_fn(obs) -> float,
+        e.g. from t2s_predict.load_t2s_predictor.
+
+    What to look for:
+      - Success panel: a usable model tracks the dashed ground-truth line
+        downward and reaches ~0 at the success marker. Flat lines, or curves
+        that never descend, mean the model isn't tracking progress at all.
+      - Failure panel: there is no ground truth (success never happens), so
+        the useful signal is whether predictions stay HIGH. A model that
+        confidently predicts "almost there" throughout a failing trajectory
+        is actively misleading as a reward, even with a good MAE on
+        successful rollouts.
+    """
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5), sharey=True)
+    colors = plt.cm.tab10.colors
+
+    for ax, (scenario, traj) in zip(axes, trajectories.items()):
+        obs = traj["obs"]
+        for i, (combo, predict_fn) in enumerate(predictors.items()):
+            preds = np.array([predict_fn(o) for o in obs], dtype=np.float32)
+            ax.plot(preds, color=colors[i % len(colors)], label=combo, linewidth=1.6)
+
+        if traj["truth"] is not None:
+            ax.plot(traj["truth"], color="black", linestyle="--", linewidth=2, label="ground truth")
+        if traj["success_step"] is not None:
+            ax.axvline(traj["success_step"], color="black", alpha=0.3, linewidth=1)
+            ax.annotate("success", (traj["success_step"], ax.get_ylim()[1] * 0.9),
+                         fontsize=8, rotation=90, va="top")
+        else:
+            ax.axhline(censor_label, color="gray", linestyle=":", linewidth=1,
+                        label=f"censor label ({censor_label:.0f})")
+
+        n_steps = len(obs)
+        ax.set_title(f"{scenario} trajectory "
+                      f"({'succeeded at ' + str(traj['success_step']) if traj['success_step'] is not None else 'never succeeded'}"
+                      f", {n_steps} steps)")
+        ax.set_xlabel("step")
+        ax.grid(alpha=0.3)
+
+    axes[0].set_ylabel("predicted steps remaining")
+    axes[0].legend(fontsize=8)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return fig
+
+
 def format_report_table(reports, metrics=("mae", "rmse", "pearson_r", "spearman_rho", "max_wrong_direction")):
     """
     Pure-string comparison table across combos and metrics — no matplotlib,
