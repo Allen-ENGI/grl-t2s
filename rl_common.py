@@ -57,13 +57,22 @@ class SuccessRateCallback(BaseCallback):
         return success_step
 
     def _on_step(self) -> bool:
-        if self.n_calls % self.ckpt_freq == 0:
-            path = os.path.join(self.ckpt_dir, f"{self.ckpt_prefix}_{self.n_calls}.zip")
+        # Use num_timesteps (total ENVIRONMENT steps across all parallel envs),
+        # not n_calls (number of _on_step invocations). With n_envs>1 these
+        # differ by a factor of n_envs, which would otherwise make eval_freq /
+        # ckpt_freq mean different things in Stage 1 (n_envs=4) vs Stage 5
+        # (n_envs=6), and skew every logged step number.
+        # The modulo is a range check rather than == 0 because num_timesteps
+        # jumps by n_envs each call and can step straight over an exact multiple.
+        n_envs = getattr(self.training_env, "num_envs", 1)
+
+        if self.num_timesteps % self.ckpt_freq < n_envs:
+            path = os.path.join(self.ckpt_dir, f"{self.ckpt_prefix}_{self.num_timesteps}.zip")
             self.model.save(path)
             if self.verbose:
                 print(f"[ckpt] saved {path}")
 
-        if self.n_calls % self.eval_freq == 0:
+        if self.num_timesteps % self.eval_freq < n_envs:
             success_steps = [self._run_eval_episode() for _ in range(self.n_eval_episodes)]
             success_rate = sum(s is not None for s in success_steps) / self.n_eval_episodes
             times = [s for s in success_steps if s is not None]
@@ -73,13 +82,13 @@ class SuccessRateCallback(BaseCallback):
             if mean_t2s is not None:
                 self.logger.record("eval/mean_time_to_success", mean_t2s)
 
-            self.history.append(dict(step=self.n_calls, success_rate=success_rate,
+            self.history.append(dict(step=self.num_timesteps, success_rate=success_rate,
                                       mean_time_to_success=mean_t2s,
                                       raw_time_to_success=success_steps, timestamp=time.time()))
             with open(os.path.join(self.ckpt_dir, "eval_history.json"), "w") as f:
                 json.dump(self.history, f, indent=2)
             if self.verbose:
-                print(f"[eval @ {self.n_calls}] success_rate={success_rate:.2f} mean_t2s={mean_t2s}")
+                print(f"[eval @ {self.num_timesteps}] success_rate={success_rate:.2f} mean_t2s={mean_t2s}")
         return True
 
 
@@ -95,14 +104,19 @@ def train_sac(train_env, eval_env, run_dir, total_timesteps, ckpt_prefix="policy
     """
     from stable_baselines3 import SAC
 
-    sac_kwargs = dict(
+    # Build defaults, then let caller-supplied sac_kwargs override them.
+    # (Doing this as dict(..., **sac_kwargs) raises TypeError on any key the
+    # caller also sets — e.g. buffer_size — which defeats the point of the
+    # override hook.)
+    resolved_kwargs = dict(
         policy="MlpPolicy", learning_rate=3e-4, buffer_size=1_000_000,
         batch_size=256, tau=0.005, gamma=0.99, ent_coef="auto",
         policy_kwargs=dict(net_arch=[400, 400]),
-        **(sac_kwargs or {}),
     )
+    resolved_kwargs.update(sac_kwargs or {})
+
     model = SAC(env=train_env, tensorboard_log=os.path.join(run_dir, tb_subdir),
-                verbose=0, seed=seed, **sac_kwargs)
+                verbose=0, seed=seed, **resolved_kwargs)
 
     if smoke_test_steps:
         smoke_cb = SuccessRateCallback(eval_env, run_dir, eval_freq=min(500, smoke_test_steps),
