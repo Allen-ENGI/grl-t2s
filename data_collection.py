@@ -109,11 +109,27 @@ def build_labels(obs_seq, first_success, censor_label=CENSOR_LABEL, include_stag
 # ---- rollout collection (touches the sim) -------------------------------
 
 def collect_episode(policy, env, deterministic=True, seed=None, noise_std=0.0):
+    """
+    Rolls out one episode, returning (obs_seq, flags, first_success).
+
+    INDEXING CONTRACT (this was an off-by-one bug; see below):
+      obs_seq has T+1 entries for T actions — states s_0 .. s_T.
+      flags has T entries; flags[t] is the success flag returned by the step
+      that took s_t -> s_{t+1}, so it describes state s_{t+1}, NOT s_t.
+      first_success is therefore t+1, the index of the first state that IS
+      successful — not t, the last state that isn't.
+
+    The previous version recorded `first_success = t` and never stored the
+    final post-step observation. That made build_labels assign
+    steps_remaining=0 to the last PRE-success frame, so the most informative
+    transition in every successful trajectory (1 -> 0) was flattened into
+    0 -> 0, giving TD targets no signal exactly at the terminal boundary.
+    """
     obs, _ = env.reset(seed=seed)
     obs_list, flags = [], []
     first_success = None
     for t in range(MAX_STEPS):
-        obs_list.append(obs.copy())
+        obs_list.append(np.asarray(obs, dtype=np.float32).copy())
         if policy is None:
             action = env.action_space.sample()
         else:
@@ -124,9 +140,11 @@ def collect_episode(policy, env, deterministic=True, seed=None, noise_std=0.0):
         obs, _, terminated, truncated, info = env.step(action)
         flags.append(bool(info.get(SUCCESS_KEY, 0)))
         if flags[-1] and first_success is None:
-            first_success = t
+            first_success = t + 1      # the state AFTER this step is the successful one
         if terminated or truncated:
             break
+    # store the final resulting state so index first_success always exists
+    obs_list.append(np.asarray(obs, dtype=np.float32).copy())
     return np.array(obs_list, dtype=np.float32), np.array(flags), first_success
 
 
@@ -153,9 +171,15 @@ def _discover_checkpoints(expert_policy_dir, ckpt_prefix=TASK_SLUG):
             final.append(p)
         elif suffix.isdigit():
             numbered.append((int(suffix), p))
-        # anything else (unexpected naming) is silently skipped rather than
-        # mis-sorted — this surfaces as "no numbered checkpoints found" later,
-        # which is a safer failure mode than a wrong silent selection.
+        else:
+            # Don't mis-sort an unrecognized name, but don't drop it silently
+            # either — a typo'd checkpoint vanishing without a word has cost
+            # real debugging time in this project.
+            import warnings
+            warnings.warn(
+                f"ignoring checkpoint with unrecognized suffix {suffix!r}: "
+                f"{os.path.basename(p)} (expected {{prefix}}_<steps>.zip or {{prefix}}_final.zip)",
+                RuntimeWarning, stacklevel=2)
     numbered.sort(key=lambda t: t[0])
     return [p for _, p in numbered], final
 

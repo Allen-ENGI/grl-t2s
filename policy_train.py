@@ -46,6 +46,33 @@ def train_policy(run_dir, predict_t2s, reward_mode="absolute", total_timesteps=1
     return model, history
 
 
+def load_vecnormalize(run_dir, venv):
+    """
+    Restore the VecNormalize statistics a policy was trained with.
+
+    train_policy saves vecnormalize.pkl, but nothing used to read it back —
+    every eval/visualisation path built a raw env instead. With
+    norm_reward=True the policy was trained against a rescaled reward
+    stream, so any later stage that skips this is silently evaluating under
+    different conditions than training. Call this whenever you reload a
+    trained policy for anything reward-related.
+
+    Returns the wrapped env with training=False and norm_reward=False, the
+    standard configuration for evaluation.
+    """
+    from stable_baselines3.common.vec_env import VecNormalize
+
+    path = os.path.join(run_dir, "vecnormalize.pkl")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"no vecnormalize.pkl in {run_dir}; this run either predates the "
+            "save or was trained without VecNormalize")
+    venv = VecNormalize.load(path, venv)
+    venv.training = False
+    venv.norm_reward = False
+    return venv
+
+
 def run_sweep(t2s_run_dir, results_module, combos, seeds, t2s_seeds=None,
                sweep_name="sweep_v1", reward_mode="absolute", total_timesteps=300_000,
                skip_existing=True, **train_kwargs):

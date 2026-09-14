@@ -63,12 +63,21 @@ def compute_step_rewards(preds, reward_mode="absolute", time_penalty=None):
 
 
 def analyze_reward_signal(preds, obs_seq=None, reward_mode="absolute", eps=DEAD_STEP_EPS,
-                           time_penalty=None):
+                           time_penalty=None, success_step=None):
     """
     Per-trajectory reward diagnostics. obs_seq (raw observations for the same
     trajectory) enables progress_alignment; omit it to skip that metric.
     """
     rewards = compute_step_rewards(preds, reward_mode, time_penalty=time_penalty)
+    # Reproduce Time2SuccessRewardWrapper's success latch: once the episode has
+    # succeeded the wrapper charges nothing (and normally terminates), so a
+    # preview that keeps accruing -time_penalty past success misrepresents the
+    # reward exactly at the most important frame. rewards[t] covers the
+    # transition into state t+1, so transitions from success_step onward are
+    # post-success.
+    if success_step is not None and len(rewards):
+        rewards = rewards.copy()
+        rewards[success_step:] = 0.0
     if len(rewards) == 0:
         return dict(n_steps=0, total_return=0.0, mean_reward=None, reward_std=None,
                      reward_min=None, reward_max=None, dead_step_fraction=None,
@@ -124,7 +133,7 @@ def preview_reward(trajectories, predictors,
             for scenario, traj in trajectories.items():
                 per_scenario[scenario] = analyze_reward_signal(
                     preds_cache[(combo, scenario)], traj["obs"], reward_mode=mode,
-                    time_penalty=time_penalty)
+                    time_penalty=time_penalty, success_step=traj.get("success_step"))
 
             entry = dict(per_scenario=per_scenario)
             s, f = per_scenario.get("success"), per_scenario.get("failure")
@@ -190,6 +199,10 @@ def plot_reward_preview(trajectories, predictors, reward_mode="absolute", save_p
         for i, (combo, predict_fn) in enumerate(predictors.items()):
             preds = np.array([predict_fn(o) for o in traj["obs"]], dtype=np.float64)
             rewards = compute_step_rewards(preds, reward_mode, time_penalty=time_penalty)
+            ss = traj.get("success_step")
+            if ss is not None and len(rewards):
+                rewards = rewards.copy()
+                rewards[ss:] = 0.0        # match the wrapper's success latch
             ax.plot(rewards, color=colors[i % len(colors)], label=combo, linewidth=1.4)
         ax.axhline(0, color="black", linewidth=0.8, alpha=0.5)
         ax.set_title(f"{scenario} trajectory — per-step reward ({reward_mode})")

@@ -42,6 +42,8 @@ Metrics:
     predictions (a constant prediction on a constant observation is
     correct model behavior, not model failure).
 """
+import os
+
 import numpy as np
 
 from config import HAND_POS_IDX, PEG_POS_IDX, GOAL_POS_IDX
@@ -136,6 +138,161 @@ def compute_progress_metrics(obs_seq, success_step=None, include_control_onset=T
     return out
 
 
+def peg_goal_progress_fraction(distance, reset_distance, success_distance):
+    """
+    Converts a raw peg-to-goal distance into a 0-1 progress fraction.
+
+    Raw distance is misleading on its own because success does NOT occur at
+    distance 0: PEG_POS_IDX tracks the peg's body centre while GOAL_POS_IDX
+    is the hole, so at insertion the centre is still offset by roughly half
+    the peg length (measured ~0.192 in this task, vs ~0.4135 at reset).
+    A bar chart of raw distance therefore compresses the entire meaningful
+    range into the top half of the axis and makes "no progress at all" look
+    close to "solved".
+
+    Returns 0.0 at the reset distance and 1.0 at the success distance.
+    """
+    span = reset_distance - success_distance
+    if span <= 0:
+        return None
+    return float(np.clip((reset_distance - distance) / span, 0.0, 1.0))
+
+
+def load_run_histories(pattern):
+    """
+    Reads eval_history.json for every run directory matching a glob pattern.
+    Returns {run_name: history_list}, skipping runs with no history.
+    """
+    import glob
+    import json
+
+    out = {}
+    for path in sorted(glob.glob(os.path.join(pattern, "eval_history.json"))):
+        with open(path) as f:
+            hist = json.load(f)
+        if hist:
+            out[os.path.basename(os.path.dirname(path))] = hist
+    return out
+
+
+def summarize_run_progress(history, reset_distance=None, success_distance=None):
+    """
+    Best-over-training values for one run's eval history. Uses the BEST
+    (not final) value because observed runs reached peak progress early and
+    then regressed — reporting only the final checkpoint hides that entirely.
+    """
+    def best(key, reducer=min):
+        vals = [h[key] for h in history if h.get(key) is not None]
+        return reducer(vals) if vals else None
+
+    out = dict(
+        best_hand_peg=best("best_min_hand_peg_distance"),
+        final_hand_peg=(history[-1].get("best_min_hand_peg_distance")),
+        best_peg_goal=best("best_min_peg_goal_distance"),
+        final_peg_goal=(history[-1].get("best_min_peg_goal_distance")),
+        best_success=best("success_rate", max),
+        final_success=history[-1].get("success_rate"),
+        peg_moved_rate=best("peg_moved_rate", max),
+        mean_obs_movement=best("mean_obs_movement", max),
+        n_evals=len(history),
+    )
+    if reset_distance is not None and success_distance is not None and out["best_peg_goal"] is not None:
+        out["progress_fraction"] = peg_goal_progress_fraction(
+            out["best_peg_goal"], reset_distance, success_distance)
+    return out
+
+
+def plot_progress_comparison(histories, reset_distance=0.4135, success_distance=0.192,
+                              save_path=None):
+    """
+    Bar comparison across runs for every model-independent progress metric.
+
+    histories: {run_name: eval_history list}, e.g. from load_run_histories.
+    reset_distance / success_distance: calibration for the peg-goal axis —
+        measure these for your task rather than trusting the defaults
+        (see peg_goal_progress_fraction for why they matter).
+    """
+    import matplotlib.pyplot as plt
+
+    names = list(histories.keys())
+    rows = [summarize_run_progress(h, reset_distance, success_distance)
+            for h in histories.values()]
+    x = np.arange(len(names))
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+    (ax1, ax2), (ax3, ax4) = axes
+
+    # --- hand -> peg: the REACH phase. 0 means contact.
+    best_h = [r["best_hand_peg"] if r["best_hand_peg"] is not None else np.nan for r in rows]
+    fin_h = [r["final_hand_peg"] if r["final_hand_peg"] is not None else np.nan for r in rows]
+    w = 0.38
+    ax1.bar(x - w/2, best_h, w, label="best during run", color="tab:green")
+    ax1.bar(x + w/2, fin_h, w, label="final", color="tab:green", alpha=0.45)
+    ax1.set_ylabel("hand-to-peg distance")
+    ax1.set_title("Reach phase (lower = closer; 0 = contact)")
+    ax1.legend(fontsize=8)
+
+    # --- peg -> goal, with the two reference lines that make it readable
+    best_p = [r["best_peg_goal"] if r["best_peg_goal"] is not None else np.nan for r in rows]
+    fin_p = [r["final_peg_goal"] if r["final_peg_goal"] is not None else np.nan for r in rows]
+    ax2.bar(x - w/2, best_p, w, label="best during run", color="tab:orange")
+    ax2.bar(x + w/2, fin_p, w, label="final", color="tab:orange", alpha=0.45)
+    ax2.axhline(reset_distance, color="red", ls="--", lw=1.2, label=f"reset ({reset_distance:.3f})")
+    ax2.axhline(success_distance, color="green", ls="--", lw=1.2,
+                 label=f"success ({success_distance:.3f})")
+    ax2.set_ylabel("peg-to-goal distance")
+    ax2.set_title("Manipulation phase (success is NOT at 0)")
+    ax2.legend(fontsize=7)
+
+    # --- normalized progress: 0 = untouched, 1 = solved
+    frac = [(r.get("progress_fraction") or 0.0) for r in rows]
+    colors = ["tab:blue" if f > 0 else "lightgray" for f in frac]
+    ax3.bar(x, frac, color=colors)
+    ax3.set_ylim(0, 1)
+    ax3.set_ylabel("fraction of the way to success")
+    ax3.set_title("Normalized progress (0 = peg untouched, 1 = solved)")
+    for xi, f in zip(x, frac):
+        ax3.text(xi, f + 0.02, f"{f:.0%}", ha="center", fontsize=8)
+
+    # --- did the object move at all, and was the arm active
+    moved = [(r.get("peg_moved_rate") or 0.0) for r in rows]
+    ax4.bar(x - w/2, moved, w, label="peg moved rate", color="tab:purple")
+    mv = [r.get("mean_obs_movement") or 0.0 for r in rows]
+    mv_norm = [m / max(mv) if max(mv) > 0 else 0 for m in mv]
+    ax4.bar(x + w/2, mv_norm, w, label="obs movement (normalized)",
+             color="tab:gray", alpha=0.6)
+    ax4.set_ylim(0, 1.05)
+    ax4.set_title("Object contact and arm activity")
+    ax4.legend(fontsize=8)
+
+    for ax in (ax1, ax2, ax3, ax4):
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, rotation=30, ha="right", fontsize=8)
+        ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return fig
+
+
+def format_progress_table(histories, reset_distance=0.4135, success_distance=0.192):
+    """Pure-string version of plot_progress_comparison, for logging."""
+    header = (f"{'run':<34}{'hand->peg':>11}{'peg->goal':>11}{'progress':>10}"
+              f"{'moved':>8}{'succ':>7}")
+    lines = [header, "-" * len(header)]
+    for name, hist in histories.items():
+        r = summarize_run_progress(hist, reset_distance, success_distance)
+        def f(v, p=4):
+            return f"{v:.{p}f}" if v is not None else "--"
+        frac = r.get("progress_fraction")
+        lines.append(
+            f"{name:<34}{f(r['best_hand_peg']):>11}{f(r['best_peg_goal']):>11}"
+            f"{(f'{frac:.0%}' if frac is not None else '--'):>10}"
+            f"{f(r['peg_moved_rate'], 2):>8}{f(r['best_success'], 2):>7}"
+        )
+    return "\n".join(lines)
 def aggregate_progress_metrics(metric_dicts):
     """
     Averages a list of compute_progress_metrics outputs (e.g. across eval
