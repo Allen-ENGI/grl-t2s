@@ -6,12 +6,6 @@ detection, label building, noise-escalation search) have no sim/torch
 dependency and are unit-tested in tests/test_data_collection.py. Only
 `collect_dataset` / `select_failure_inducing_config` touch the sim.
 
-CHANGE: forced failure-trajectory collection.
-Relying on noise=0.4 applied to an already-competent checkpoint does NOT
-reliably produce failures — a policy that's mostly solved the task often
-still succeeds even with noise added, just less cleanly. If your dataset
-ends up with ~0 failed episodes (check dataset_summary.json), this is why.
-
 Instead, `select_failure_inducing_config` explicitly:
   1. always starts from the EARLIEST available checkpoint (weakest policy),
   2. empirically PROBES actual success rate at increasing noise levels,
@@ -108,23 +102,23 @@ def build_labels(obs_seq, first_success, censor_label=CENSOR_LABEL, include_stag
 
 # ---- rollout collection (touches the sim) -------------------------------
 
-def collect_episode(policy, env, deterministic=True, seed=None, noise_std=0.0):
+def collect_episode(policy, env, deterministic=False, seed=None, noise_std=0.0, rng=None):
     """
     Rolls out one episode, returning (obs_seq, flags, first_success).
 
-    INDEXING CONTRACT (this was an off-by-one bug; see below):
+      `rng`: pass a np.random.Generator to make noise reproducible per
+      episode. Without it, noise draws from the global NumPy RNG, whose
+      state depends on everything else that ran first — so a "seeded" run
+      was not actually reproducible.
+
+    INDEXING CONTRACT:
       obs_seq has T+1 entries for T actions — states s_0 .. s_T.
       flags has T entries; flags[t] is the success flag returned by the step
       that took s_t -> s_{t+1}, so it describes state s_{t+1}, NOT s_t.
       first_success is therefore t+1, the index of the first state that IS
       successful — not t, the last state that isn't.
-
-    The previous version recorded `first_success = t` and never stored the
-    final post-step observation. That made build_labels assign
-    steps_remaining=0 to the last PRE-success frame, so the most informative
-    transition in every successful trajectory (1 -> 0) was flattened into
-    0 -> 0, giving TD targets no signal exactly at the terminal boundary.
     """
+    rng = rng if rng is not None else np.random
     obs, _ = env.reset(seed=seed)
     obs_list, flags = [], []
     first_success = None
@@ -133,9 +127,9 @@ def collect_episode(policy, env, deterministic=True, seed=None, noise_std=0.0):
         if policy is None:
             action = env.action_space.sample()
         else:
-            action, _ = policy.predict(obs, deterministic=deterministic)
+            action, _ = policy.predict(obs, deterministic=False)
             if noise_std > 0:
-                action = np.clip(action + np.random.normal(0, noise_std, action.shape),
+                action = np.clip(action + rng.normal(0, noise_std, action.shape),
                                   env.action_space.low, env.action_space.high)
         obs, _, terminated, truncated, info = env.step(action)
         flags.append(bool(info.get(SUCCESS_KEY, 0)))
@@ -192,7 +186,7 @@ def probe_success_rate(policy, env, noise_std, n_probe=5, seed_start=900):
     """
     successes = 0
     for i in range(n_probe):
-        _, _, first_success = collect_episode(policy, env, deterministic=True,
+        _, _, first_success = collect_episode(policy, env, deterministic=False,
                                                seed=seed_start + i, noise_std=noise_std)
         successes += first_success is not None
     return successes / n_probe
@@ -331,29 +325,37 @@ def collect_dataset(run_dir, plan=None, censor_label=CENSOR_LABEL, include_stage
                      failure_noise_candidates=(0.4, 0.6, 0.8, 1.0),
                      failure_n_probe=5, failure_max_success_rate=0.3,
                      failure_checkpoint=None,
-                     expert_policy_dir=EXPERT_POLICY_DIR, ckpt_prefix=TASK_SLUG):
+                     expert_policy_dir=EXPERT_POLICY_DIR, ckpt_prefix=TASK_SLUG,
+                     collection_seeds=(0,), deterministic=False,
+                     episodes_multiplier=1, verbose=True):
     """
-    Runs `plan` (see default_collection_plan) and writes dataset.npz +
-    dataset_summary.json into run_dir (obtained from results.new_run_dir).
-    Requires stable_baselines3's SAC — imported lazily so this module can be
-    unit-tested (coupling_signals / build_labels) without SB3 installed.
+    Runs `plan` once per entry in `collection_seeds` and writes dataset.npz +
+    dataset_summary.json into run_dir.
 
-    force_failure_source=True (current default): before running `plan`, probes
-    a policy at increasing noise (see select_failure_inducing_config) and adds
-    n_failure_episodes genuinely-verified-to-often-fail episodes.
+    collection_seeds: list of master seeds. Each one re-runs the whole plan
+        with its own np.random.Generator and its own env-reset seed block, so
+        the resulting trajectories are independent AND reproducible. Use
+        several to get genuine diversity; use one to reproduce a single run.
 
-    failure_checkpoint: which policy to use as that failure source. Pass a
-        filename (e.g. "peg_insert_side_v3_100000.zip") or full path to choose
-        explicitly — recommended, since auto-discovery can only guess "weakest"
-        from filename ordering and has no way to know whether your earliest
-        saved checkpoint is genuinely weak. None = auto-select earliest found.
+    deterministic: False (new default) SAMPLES from SAC's policy distribution
+        instead of taking its mean. With the scene pinned and MuJoCo being
+        deterministic, deterministic=True made every clean rollout from a
+        checkpoint bit-identical regardless of seed — measured at 222
+        episodes collapsing to 93 unique trajectories. Sampling gives real
+        expert-quality variation instead.
+
+    episodes_multiplier: scales every episode count in `plan` (and
+        n_failure_episodes). Use to grow the dataset without editing the plan.
+
+    force_failure_source=True: before running `plan`, probes a policy at
+        increasing noise (see select_failure_inducing_config) and prepends a
+        batch of verified-to-often-fail episodes.
     """
     from stable_baselines3 import SAC
     from env_utils import make_fixed_scene_env
     import json
 
     plan = plan or default_collection_plan(expert_policy_dir=expert_policy_dir, ckpt_prefix=ckpt_prefix)
-    episodes = []
     scene = make_fixed_scene_env()
 
     fail_ckpt = fail_noise = measured_rate = None
@@ -364,20 +366,36 @@ def collect_dataset(run_dir, plan=None, censor_label=CENSOR_LABEL, include_stage
             max_success_rate=failure_max_success_rate,
             failure_checkpoint=failure_checkpoint,
         )
-        print(f"forced failure source: {os.path.basename(fail_ckpt)} @ noise={fail_noise} "
-              f"(measured success rate {measured_rate:.0%} over {failure_n_probe} probes)")
+        if verbose:
+            print(f"forced failure source: {os.path.basename(fail_ckpt)} @ noise={fail_noise} "
+                  f"(measured success rate {measured_rate:.0%} over {failure_n_probe} probes)")
         plan = [(fail_ckpt, fail_noise, n_failure_episodes)] + list(plan)
 
-    seed = 0
-    for ck, ns, n in plan:
-        pol = SAC.load(ck) if ck else None
-        tag = f"{os.path.basename(ck) if ck else 'random'}_n{ns}"
-        for _ in range(n):
-            obs_seq, flags, fs = collect_episode(pol, scene, deterministic=True, seed=seed, noise_std=ns)
-            seed += 1
-            steps, stage, onset = build_labels(obs_seq, fs, censor_label, include_stage_label=include_stage_label)
-            episodes.append(dict(obs=obs_seq, steps=steps, stage=stage, onset=onset,
-                                  success=fs, source=tag))
+    # load each checkpoint once rather than per episode
+    policies = {ck: (SAC.load(ck) if ck else None) for ck, _ns, _n in plan}
+
+    episodes = []
+    for master_seed in collection_seeds:
+        rng = np.random.default_rng(master_seed)
+        # disjoint env-reset seed block per master seed, so blocks never collide
+        seed = master_seed * 100_000
+        for ck, ns, n in plan:
+            pol = policies[ck]
+            tag = f"{os.path.basename(ck) if ck else 'random'}_n{ns}_s{master_seed}"
+            for _ in range(int(n * episodes_multiplier)):
+                obs_seq, flags, fs = collect_episode(
+                    pol, scene, deterministic=deterministic, seed=seed,
+                    noise_std=ns, rng=rng)
+                seed += 1
+                steps, stage, onset = build_labels(
+                    obs_seq, fs, censor_label, include_stage_label=include_stage_label)
+                episodes.append(dict(obs=obs_seq, steps=steps, stage=stage, onset=onset,
+                                      success=fs, source=tag, collection_seed=master_seed))
+        if verbose:
+            done = sum(1 for e in episodes if e["collection_seed"] == master_seed)
+            succ = sum(1 for e in episodes
+                       if e["collection_seed"] == master_seed and e["success"] is not None)
+            print(f"  seed {master_seed}: {done} episodes ({succ} successful)")
     scene.close()
 
     X = np.concatenate([e["obs"] for e in episodes])
@@ -385,16 +403,28 @@ def collect_dataset(run_dir, plan=None, censor_label=CENSOR_LABEL, include_stage
     stage = np.concatenate([e["stage"] for e in episodes])
     ep_ids = np.concatenate([np.full(len(e["obs"]), i, dtype=np.int32) for i, e in enumerate(episodes)])
     frames = np.concatenate([np.arange(len(e["obs"]), dtype=np.int32) for e in episodes])
+    seeds_per_row = np.concatenate([np.full(len(e["obs"]), e["collection_seed"], dtype=np.int32)
+                                     for e in episodes])
 
     np.savez(os.path.join(run_dir, "dataset.npz"),
-              X=X, y_steps=y, stage=stage, episode_ids=ep_ids, frame_idxs=frames)
+              X=X, y_steps=y, stage=stage, episode_ids=ep_ids, frame_idxs=frames,
+              collection_seeds=seeds_per_row)
+
+    # duplicate check: the defect this rewrite exists to fix, so report it
+    sigs = [hash(e["obs"].tobytes()) for e in episodes]
+    n_unique = len(set(sigs))
 
     succ = sum(1 for e in episodes if e["success"] is not None)
     summary = dict(
         total_rows=int(len(X)), total_episodes=int(len(episodes)),
+        unique_trajectories=int(n_unique),
+        duplicate_fraction=float(1 - n_unique / len(episodes)) if episodes else 0.0,
         obs_dim=int(X.shape[1]),
         successful_episodes=int(succ), failed_episodes=int(len(episodes) - succ),
         censor_label=float(censor_label),
+        collection_seeds=[int(s) for s in collection_seeds],
+        deterministic_policy=bool(deterministic),
+        episodes_multiplier=float(episodes_multiplier),
         stage_fractions={int(k): float((stage == k).mean()) for k in (0, 1, 2)},
         sources=sorted({e["source"] for e in episodes}),
         forced_failure_source=(dict(checkpoint=os.path.basename(fail_ckpt), noise=fail_noise,
@@ -403,4 +433,13 @@ def collect_dataset(run_dir, plan=None, censor_label=CENSOR_LABEL, include_stage
     )
     with open(os.path.join(run_dir, "dataset_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
+
+    if verbose:
+        print(f"\n{len(episodes)} episodes -> {n_unique} unique trajectories "
+              f"({summary['duplicate_fraction']:.1%} duplicates)")
+        print(f"{summary['successful_episodes']} successful / "
+              f"{summary['failed_episodes']} failed, {len(X):,} rows")
+        if summary['duplicate_fraction'] > 0.1:
+            print(">>> WARNING: high duplicate fraction. Check deterministic=False "
+                  "and that collection_seeds has more than one entry.")
     return summary

@@ -143,6 +143,32 @@ def check_object_movement(X, episode_ids, eps=1e-6):
     )
 
 
+def check_trajectory_uniqueness(X, episode_ids):
+    """
+    Counts distinct trajectories. Duplicates arise when the scene is pinned,
+    MuJoCo is deterministic, and the policy is queried with
+    deterministic=True — then every clean rollout from a checkpoint is
+    bit-identical no matter what seed reset() got. Measured once at 222
+    episodes -> 93 unique (58% duplicates), concentrated in exactly the
+    expert rollouts the "succ" condition trains on.
+
+    Duplicates also break the train/val split: GroupShuffleSplit groups by
+    episode_ids, not by content, so identical trajectories with different
+    ids can land on both sides and make val MSE meaningless.
+    """
+    sigs = [hash(X[np.flatnonzero(episode_ids == e)].tobytes())
+            for e in np.unique(episode_ids)]
+    n_ep, n_unique = len(sigs), len(set(sigs))
+    frac = 1 - n_unique / n_ep if n_ep else 0.0
+    return dict(
+        total_episodes=n_ep, unique_trajectories=n_unique,
+        duplicate_fraction=frac,
+        verdict=("OK" if frac < 0.05 else
+                  f"{frac:.0%} DUPLICATES — set deterministic=False and use "
+                  "multiple collection_seeds"),
+    )
+
+
 def check_label_sanity(y, episode_ids, censor_label=CENSOR_LABEL, max_steps=MAX_STEPS):
     """Censoring ceiling vs episode length, and monotonicity within episodes."""
     non_monotonic = []
@@ -180,6 +206,7 @@ def audit_dataset(dataset_path, summary_path=None, verbose=True):
         path=dataset_path,
         n_rows=int(len(X)), obs_dim=int(X.shape[1]),
         obs_dim_matches_config=bool(X.shape[1] == OBS_DIM),
+        trajectory_uniqueness=check_trajectory_uniqueness(X, episode_ids),
         success_boundary=check_success_boundary(y, episode_ids),
         failure_coverage=check_failure_coverage(y, episode_ids),
         exploration_coverage=check_exploration_coverage(X),
@@ -205,6 +232,7 @@ def format_audit(report):
         "",
     ]
     order = [
+        ("trajectory_uniqueness", "trajectory diversity"),
         ("success_boundary", "success-frame labelling"),
         ("failure_coverage", "failure coverage"),
         ("exploration_coverage", "exploration-region coverage"),
