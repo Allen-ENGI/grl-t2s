@@ -76,21 +76,40 @@ def max_wrong_direction(pred_curve):
 # ---- rollout-based evaluation against held-out POLICIES ------------------
 
 def eval_rollout(predict_fn, policy, seed, max_steps=500, random_policy=False,
-                  stop_after_success=CONFIRM_BUFFER_DEFAULT):
+                  stop_after_success=CONFIRM_BUFFER_DEFAULT, deterministic=False):
     """
     Runs one rollout on the fixed scene using `policy` (never one used to
     generate training data), recording the model's prediction at every step.
     predict_fn(obs) -> float prediction, already normalized/clipped by caller.
     Returns (preds: np.ndarray, success_step: int|None).
+
+    deterministic=False (default) SAMPLES the policy. With the scene pinned
+    and MuJoCo deterministic, deterministic=True made every eval seed produce
+    the SAME trajectory — so "spread across 8 seeds" measured one rollout
+    eight times and the reported std was ~0 by construction, not because the
+    models were stable. Sampling gives genuinely different rollouts, so the
+    std means something.
     """
     from env_utils import make_fixed_scene_env  # lazy: sim dependency
 
     env = make_fixed_scene_env()
+    # Seed the POLICY's action sampling, not just the env reset. With
+    # deterministic=False the actions come from torch's global RNG, so without
+    # this an evaluation is not reproducible: re-running the same models gave
+    # materially different numbers (one combo moved 1.25 -> 2.34 MAE between
+    # two runs). Seeding here keeps rollouts different ACROSS seeds within a
+    # run, but identical across runs of the same seed.
+    if not deterministic:
+        import torch
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
     obs, _ = env.reset(seed=seed)
     preds, success = [], None
     for t in range(max_steps):
         preds.append(predict_fn(obs))
-        action = env.action_space.sample() if random_policy else policy.predict(obs, deterministic=True)[0]
+        action = (env.action_space.sample() if random_policy
+                  else policy.predict(obs, deterministic=deterministic)[0])
         obs, _, term, trunc, info = env.step(action)
         if info.get(SUCCESS_KEY, 0) and success is None:
             success = t
@@ -103,7 +122,7 @@ def eval_rollout(predict_fn, policy, seed, max_steps=500, random_policy=False,
 
 
 def run_full_evaluation(predict_fn, eval_success_policy, eval_failure_policy,
-                         n_seeds=8, seed_offset=500, max_steps=500):
+                         n_seeds=8, seed_offset=500, max_steps=500, deterministic=False):
     """
     The stage-4 deliverable: evaluate against policies that generated NONE
     of the training data. Returns a report dict with per-scenario metrics.
@@ -120,7 +139,8 @@ def run_full_evaluation(predict_fn, eval_success_policy, eval_failure_policy,
     report = {"success_scenario": [], "failure_scenario": []}
 
     for seed in range(seed_offset, seed_offset + n_seeds):
-        preds, success = eval_rollout(predict_fn, eval_success_policy, seed=seed, max_steps=max_steps)
+        preds, success = eval_rollout(predict_fn, eval_success_policy, seed=seed,
+                                       max_steps=max_steps, deterministic=deterministic)
         if success is None:
             continue  # this "reliable" policy failed on this seed; skip rather than fabricate ground truth
         truths = np.array([max(0, success - t) for t in range(len(preds))], dtype=np.float32)
@@ -130,7 +150,8 @@ def run_full_evaluation(predict_fn, eval_success_policy, eval_failure_policy,
         report["success_scenario"].append(m)
 
     for seed in range(seed_offset, seed_offset + n_seeds):
-        preds, success = eval_rollout(predict_fn, eval_failure_policy, seed=seed, max_steps=max_steps)
+        preds, success = eval_rollout(predict_fn, eval_failure_policy, seed=seed,
+                                       max_steps=max_steps, deterministic=deterministic)
         report["failure_scenario"].append(dict(
             seed=seed, succeeded_unexpectedly=success is not None,
             pred_min=float(preds.min()), pred_max=float(preds.max()),
@@ -150,8 +171,48 @@ def run_full_evaluation(predict_fn, eval_success_policy, eval_failure_policy,
     return report
 
 
+def metric_mean_std(report, metric):
+    """
+    (mean, std) for a metric across the per-seed evaluation rollouts.
+
+    success_scenario_summary holds only means, but report["success_scenario"]
+    keeps one entry per seed — so the spread IS recoverable and should be
+    shown. A combo whose MAE is 5.0 +/- 0.3 is a different claim from one at
+    5.0 +/- 4.0, and the bar chart previously hid that distinction entirely.
+    """
+    rows = report.get("success_scenario", [])
+    vals = [r[metric] for r in rows if r.get(metric) is not None]
+    if not vals:
+        # fall back to the summary mean when per-seed detail is unavailable
+        m = report.get("success_scenario_summary", {}).get(metric)
+        return (m, None)
+    return (float(np.mean(vals)), float(np.std(vals)))
+
+
+def metric_values(report, metric):
+    """Per-seed values for a metric (empty list if only a summary exists)."""
+    return [r[metric] for r in report.get("success_scenario", [])
+            if r.get(metric) is not None]
+
+
+def _select_combos(reports, combos=None, exclude=None):
+    """Resolve an explicit include list / exclude list against the report keys."""
+    names = list(reports.keys())
+    if combos is not None:
+        missing = [c for c in combos if c not in reports]
+        if missing:
+            raise KeyError(f"combos not in reports: {missing}. Available: {names}")
+        names = list(combos)
+    if exclude:
+        names = [c for c in names if c not in exclude]
+    if not names:
+        raise ValueError("no combos left to plot after filtering")
+    return names
+
+
 def plot_combo_comparison(reports, metrics=("mae", "rmse", "spearman_rho", "max_wrong_direction"),
-                           save_path=None):
+                           save_path=None, combos=None, exclude=None, show_std=True,
+                           sort_by=None):
     """
     Bar chart comparing every combo (e.g. mc_succ, td0_succ, ...) across the
     given metrics, one subplot per metric. Reads reports[combo]['success_scenario_summary'].
@@ -160,10 +221,16 @@ def plot_combo_comparison(reports, metrics=("mae", "rmse", "spearman_rho", "max_
     """
     import matplotlib.pyplot as plt
 
-    combos = list(reports.keys())
+    names = _select_combos(reports, combos, exclude)
+    if sort_by:
+        higher = sort_by in ("pearson_r", "spearman_rho")
+        names.sort(key=lambda c: (metric_mean_std(reports[c], sort_by)[0]
+                                   if metric_mean_std(reports[c], sort_by)[0] is not None
+                                   else (float("-inf") if higher else float("inf"))),
+                    reverse=higher)
     available_metrics = [
         m for m in metrics
-        if any(m in reports[c].get("success_scenario_summary", {}) for c in combos)
+        if any(m in reports[c].get("success_scenario_summary", {}) for c in names)
     ]
     if not available_metrics:
         raise ValueError("none of the requested metrics are present in any report's success_scenario_summary")
@@ -173,19 +240,58 @@ def plot_combo_comparison(reports, metrics=("mae", "rmse", "spearman_rho", "max_
         axes = [axes]
 
     for ax, metric in zip(axes, available_metrics):
-        values = [reports[c].get("success_scenario_summary", {}).get(metric, np.nan) for c in combos]
-        bars = ax.bar(combos, values, color="tab:blue")
+        stats = [metric_mean_std(reports[c], metric) for c in names]
+        values = [np.nan if m is None else m for m, _sd in stats]
+        errs = [0.0 if sd is None else sd for _m, sd in stats] if show_std else None
+
+        bars = ax.bar(names, values, yerr=errs, capsize=4, color="tab:blue",
+                       error_kw=dict(ecolor="0.25", lw=1.2))
+        if show_std:
+            # error bars alone are invisible when the spread is small relative
+            # to the bar height, so also draw every seed as a dot and print the
+            # number — a tiny bar with +/-0.02 and one with +/-2.0 must not look
+            # the same.
+            for xi, c in enumerate(names):
+                pts = metric_values(reports[c], metric)
+                if pts:
+                    ax.scatter([xi] * len(pts), pts, s=14, color="black",
+                                zorder=3, alpha=0.75)
+            tops = []
+            for xi, ((mean, sd), c) in enumerate(zip(stats, names)):
+                if mean is None:
+                    continue
+                pts = metric_values(reports[c], metric)
+                # clear the error bar AND the highest seed dot
+                y = max([mean + (sd or 0.0)] + pts)
+                tops.append(y)
+            headroom = max(tops, default=1.0)
+            for xi, ((mean, sd), c) in enumerate(zip(stats, names)):
+                if mean is None:
+                    continue
+                pts = metric_values(reports[c], metric)
+                y = max([mean + (sd or 0.0)] + pts)
+                label = f"{mean:.2f}" + (f"\n±{sd:.2f}" if sd is not None else "")
+                ax.text(xi, y + 0.03 * headroom, label, ha="center", va="bottom",
+                         fontsize=7.5)
+            ax.set_ylim(top=headroom * 1.30)
         # highlight the best combo for this metric (lower is better, except correlations)
         higher_is_better = metric in ("pearson_r", "spearman_rho")
         finite = [v for v in values if not np.isnan(v)]
         if finite:
             best_val = max(finite) if higher_is_better else min(finite)
-            for bar, v in zip(bars, values):
-                if v == best_val:
-                    bar.set_color("tab:green")
-        ax.set_title(metric)
-        ax.set_xticklabels(combos, rotation=45, ha="right")
+            winners = [v for v in values if v == best_val]
+            # a metric where every combo ties (e.g. correlations all at 0.98)
+            # has no winner — colouring them all green implies a distinction
+            # the numbers do not support
+            if len(winners) < len(finite):
+                for bar, v in zip(bars, values):
+                    if v == best_val:
+                        bar.set_color("tab:green")
+        ax.set_title(metric + ("  (mean ± std over seeds)" if show_std else ""))
+        ax.set_xticks(range(len(names)))
+        ax.set_xticklabels(names, rotation=45, ha="right", fontsize=8)
         ax.axhline(0, color="gray", lw=0.5)
+        ax.grid(axis="y", alpha=0.3)
 
     plt.tight_layout()
     if save_path:
@@ -295,7 +401,8 @@ def plot_sample_trajectories(trajectories, predictors, save_path=None, censor_la
     return fig
 
 
-def format_report_table(reports, metrics=("mae", "rmse", "pearson_r", "spearman_rho", "max_wrong_direction")):
+def format_report_table(reports, metrics=("mae", "rmse", "pearson_r", "spearman_rho", "max_wrong_direction"),
+                         combos=None, exclude=None, show_std=True, sort_by=None):
     """
     Pure-string comparison table across combos and metrics — no matplotlib,
     so this is unit-testable and also useful for logging/console output
@@ -303,23 +410,81 @@ def format_report_table(reports, metrics=("mae", "rmse", "pearson_r", "spearman_
     print it yourself (kept as a pure function rather than printing directly
     so it's testable and reusable for writing to a log file).
     """
-    combos = list(reports.keys())
+    if not reports:
+        return "(no reports)"
+    names = _select_combos(reports, combos, exclude)
+    if sort_by:
+        higher = sort_by in ("pearson_r", "spearman_rho")
+        names.sort(key=lambda c: (metric_mean_std(reports[c], sort_by)[0]
+                                   if metric_mean_std(reports[c], sort_by)[0] is not None
+                                   else (float("-inf") if higher else float("inf"))),
+                    reverse=higher)
+
     available_metrics = [
         m for m in metrics
-        if any(m in reports[c].get("success_scenario_summary", {}) for c in combos)
+        if any(m in reports[c].get("success_scenario_summary", {}) for c in names)
     ]
     if not available_metrics:
         return "(no metrics available in any report's success_scenario_summary)"
 
-    col_w = 14
-    header = f"{'combo':<16}" + "".join(f"{m:>{col_w}}" for m in available_metrics)
+    col_w = 18 if show_std else 14
+    header = f"{'combo':<18}" + "".join(f"{m[:col_w]:>{col_w}}" for m in available_metrics)
     lines = [header, "-" * len(header)]
-    for c in combos:
-        summary = reports[c].get("success_scenario_summary", {})
-        row = f"{c:<16}"
+    for c in names:
+        row = f"{c:<18}"
         for m in available_metrics:
-            v = summary.get(m)
-            row += f"{v:>{col_w}.4f}" if v is not None else f"{'--':>{col_w}}"
+            mean, sd = metric_mean_std(reports[c], m)
+            if mean is None:
+                row += f"{'--':>{col_w}}"
+            elif show_std and sd is not None:
+                row += f"{mean:>{col_w - 7}.3f} ±{sd:<5.3f}"
+            else:
+                row += f"{mean:>{col_w}.4f}"
         lines.append(row)
     return "\n".join(lines)
 
+
+
+def evaluate_runs(t2s_runs, eval_success_policy, eval_failure_policy,
+                   combos=None, n_seeds=8, seed_offset=500, deterministic=False,
+                   verbose=True, **eval_kwargs):
+    """
+    Evaluate the SAME combo names across SEVERAL t2s_model runs, in one table.
+
+    Needed because combo names repeat across runs: a gamma probe trained with
+    censor_schemes=('censor',) produces "tdlambda_succ", exactly the name the
+    main run already uses. Without a per-run label the second would silently
+    overwrite the first in the reports dict.
+
+    t2s_runs: {label: (run_dir, summary_rows)}. The label is appended to each
+        combo name, so an empty label leaves names unchanged. Example:
+
+            evaluate_runs({
+                '':     (t2s_run_dir, summary_rows),   # main run, gamma=1.0 censor
+                '_g99': (probe_dir,   probe_rows),     # same combos at gamma=0.99
+            }, eval_success_pol, eval_failure_pol)
+
+        gives 'tdlambda_succ' and 'tdlambda_succ_g99' side by side.
+
+    combos: optional list of combo names to evaluate from each run; None = all.
+    """
+    import t2s_predict
+
+    reports = {}
+    for label, (run_dir, rows) in t2s_runs.items():
+        wanted = rows if combos is None else [r for r in rows if r["combo"] in combos]
+        if combos is not None and len(wanted) != len(combos):
+            missing = set(combos) - {r["combo"] for r in wanted}
+            raise KeyError(f"run {label or '(main)'} is missing combos: {sorted(missing)}")
+        for row in wanted:
+            method, condition = row["combo"].rsplit("_", 1)
+            key = row["combo"] + label
+            if verbose:
+                print(f"  evaluating {key} ...", flush=True)
+            predict_fn = t2s_predict.load_t2s_predictor(
+                run_dir, method, condition, seed=row["best_seed"])
+            reports[key] = run_full_evaluation(
+                predict_fn, eval_success_policy, eval_failure_policy,
+                n_seeds=n_seeds, seed_offset=seed_offset,
+                deterministic=deterministic, **eval_kwargs)
+    return reports
