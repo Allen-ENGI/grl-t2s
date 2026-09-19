@@ -1,490 +1,492 @@
 """
 Stage 4: T2S model analysis.
 
-Critical requirement from the spec: evaluate on data the model was NOT
-trained on. Two distinct kinds of "held out" are supported and should not
-be conflated:
-  1. held-out ROWS from the same dataset (the val split from t2s_train) —
-     tests interpolation within the same policies/trajectories used to build
-     the dataset.
-  2. held-out POLICIES never used to generate any training data at all
-     (eval_success_pol / eval_failure_pol in the original notebook) —
-     tests generalization to genuinely unseen behavior. This is the
-     stronger and more meaningful test and is what run_full_evaluation
-     focuses on.
+Six public functions. The previous version had sixteen, ten of which nothing
+outside this module ever called, plus a `plot_sample_trajectories` that
+t2s_video now does better and that nothing called at all.
 
-Metrics, defined explicitly (spec asked for this):
-  - MAE (mean absolute error): mean(|prediction - true_steps_remaining|),
-    in the same units as steps_remaining (frames). Robust to outliers,
-    easy to interpret ("predictions are off by N frames on average").
-  - RMSE: sqrt(mean((prediction - true)^2)). Same units as MAE but
-    penalizes large errors more heavily — a few badly-wrong predictions
-    move RMSE much more than MAE.
-  - Pearson correlation: linear correlation between predicted and true
-    steps_remaining. Sensitive to the overall linear trend, not to scale
-    or offset errors.
-  - Spearman correlation: rank correlation between predicted and true.
-    Answers "does the model correctly order which states are closer to
-    success", independent of whether the absolute scale is right — this is
-    usually the metric that matters most for reward shaping, since SAC only
-    cares about relative ordering of predicted value along a trajectory.
-  - max_wrong_direction: the largest single-frame *increase* in a predicted
-    countdown along a successful rollout — a countdown that goes up when it
-    should be going down is the failure mode that most directly breaks
-    reward shaping (see policy_env.py).
+    assert_policies_held_out   verify the evaluation policies were reserved
+    evaluate_runs              evaluate every combo -> {name: report}
+    format_report_table        report -> string table
+    plot_combo_comparison      report -> bar chart
+    collect_eval_trajectories  reference rollouts for reward_preview / video
+    run_full_evaluation        one model's report (used by t2s_video)
+
+Two kinds of "held out", not to be conflated:
+  1. held-out ROWS — the `val` split assigned at collection time and stored in
+     dataset.npz. Interpolation within the same policies.
+  2. held-out POLICIES — checkpoints reserved via Stage 1's `holdout`, never
+     rolled out during collection. Generalization to unseen behaviour.
+`assert_policies_held_out` checks (2) against the recorded manifest rather
+than trusting that whoever ran Stage 1 remembered which files it touched.
+
+WHICH CORRELATIONS MEAN ANYTHING
+--------------------------------
+Within one success rollout the truth is max(0, S - i): exactly linear in the
+frame index. So correlating predictions against it is correlating against -i.
+Measured on the observed 73-step-success + 20-frame-tail shape:
+
+    perfect model                    pearson +1.000  spearman +1.000  MAE   0.0
+    predictions x 3                  pearson +1.000  spearman +1.000  MAE  58.1
+    predictions + 100                pearson +1.000  spearman +1.000  MAE 100.0
+    straight ramp ignoring S         pearson +0.989  spearman +0.995  MAE 121.0
+    truth vs. the frame index        pearson +0.989
+
+NO correlation fixes this, because Pearson and Spearman are both invariant to
+a global affine transform:
+
+    error class                   within-traj rho   pooled rho
+    +100 global offset                     1.0000       1.0000
+    x3 global scale                        1.0000       1.0000
+    per-trajectory normalisation           1.0000       0.7997
+    level drifts with trajectory           1.0000       0.8610
+
+Hence the division of labour in the reported metrics:
+  bias, calibration_slope  the ONLY metrics that see a global offset or scale
+                           error. bias is signed; NEGATIVE means the model
+                           claims success is nearer than it is, the dangerous
+                           direction for a reward. calibration_slope is 1.0
+                           when correct.
+  pooled_spearman          across rollouts. The only one that sees a level
+                           consistent within each trajectory but drifting
+                           between them — the observed 62-vs-200 spread.
+  step_slope_error         mean |predicted decrement - 1|. Literally the
+                           quantity reward_fn's difference modes consume, so
+                           the most directly predictive number here.
+  monotonicity_rho         the old correlation, renamed. Shape only. Read it
+                           with max_wrong_direction.
+
+Other corrections: ground truth was off by one (success recorded as the step
+index t rather than the first successful state t+1, so a model reproducing its
+training labels perfectly still scored MAE ~0.8); MAE now excludes the
+post-success tail by default; max_wrong_direction is pre-success only and
+clamped at 0; correlations average in Fisher z, since a plain mean of r is
+biased toward 0 badly near |r|~1.
 """
+import os
+
 import numpy as np
 from scipy.stats import pearsonr, spearmanr
 
-from config import CENSOR_LABEL, SUCCESS_KEY
+from config import CENSOR_LABEL, SUCCESS_KEY, steps_remaining_curve
 
-CONFIRM_BUFFER_DEFAULT = 20  # frames to keep recording after success, matching data_collection
+CONFIRM_BUFFER = 20          # frames recorded after success
+HIGHER_IS_BETTER = ("pooled_spearman", "monotonicity_rho")
+CORRELATIONS = ("pooled_pearson", "pooled_spearman", "monotonicity_rho")
+REPORT_METRICS = ("mae", "bias", "calibration_slope", "step_slope_error",
+                  "pooled_spearman", "monotonicity_rho", "max_wrong_direction")
 
 
-# ---- row-level metrics on any (pred, true) pair --------------------------
+# ---- held-out bookkeeping ----------------------------------------------
 
-def compute_metrics(preds, truths):
+def assert_policies_held_out(dataset_summary_path, policy_paths, strict=True):
     """
-    preds, truths: 1D arrays of predicted / true steps_remaining, same length.
-    Returns a dict with every metric named and defined in the module docstring.
+    Verify every policy about to be evaluated was RESERVED during collection,
+    not collected from. Stage 4's whole claim rests on this, and it used to
+    rest on memory. Raises on overlap when strict.
     """
-    preds = np.asarray(preds, dtype=np.float64)
-    truths = np.asarray(truths, dtype=np.float64)
-    err = preds - truths
-    out = dict(
-        n=len(preds),
-        mae=float(np.mean(np.abs(err))),
-        rmse=float(np.sqrt(np.mean(err ** 2))),
-    )
-    if len(preds) >= 2 and np.std(preds) > 0 and np.std(truths) > 0:
-        out["pearson_r"] = float(pearsonr(preds, truths)[0])
-        out["spearman_rho"] = float(spearmanr(preds, truths)[0])
+    import json
+
+    with open(dataset_summary_path) as f:
+        summary = json.load(f)
+    collected = set(summary.get("collected_checkpoints") or [])
+    holdout = set(summary.get("holdout_checkpoints") or [])
+    names = [os.path.basename(p) for p in policy_paths]
+
+    leaked = [n for n in names if n in collected]
+    unreserved = [n for n in names if n not in holdout]
+    if strict and leaked:
+        raise AssertionError(
+            f"evaluation policies {leaked} WERE collected from (sources: {sorted(collected)}). "
+            "The held-out-policy claim does not hold. Re-collect with these in --holdout.")
+    if strict and unreserved:
+        raise AssertionError(
+            f"evaluation policies {unreserved} are not in the declared holdout "
+            f"({sorted(holdout)}). Pass them to Stage 1's --holdout so it is recorded.")
+    return dict(evaluated=names, leaked=leaked, not_declared_holdout=unreserved,
+                ok=not leaked and not unreserved)
+
+
+# ---- metrics -------------------------------------------------------------
+
+def _corr(fn, a, b):
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
+        return None
+    v = fn(a, b)[0]
+    return None if not np.isfinite(v) else float(v)
+
+
+def fisher_mean(values):
+    """Mean of correlations via Fisher z; a plain mean of r is biased toward 0."""
+    v = np.asarray([x for x in values if x is not None], dtype=float)
+    if not len(v):
+        return None
+    return float(np.tanh(np.mean(np.arctanh(np.clip(v, -0.999999, 0.999999)))))
+
+
+def _mean(values, metric):
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return None
+    return fisher_mean(vals) if metric in CORRELATIONS else float(np.mean(vals))
+
+
+def compute_metrics(preds, truths, success_step=None):
+    """
+    Per-rollout metrics. `success_step` (index of the first successful state)
+    splits the curve: error metrics use the PRE-SUCCESS portion, since the
+    confirm buffer after success has truth == 0 throughout and would blend
+    "can it count down" with "does it decay to zero when finished".
+    """
+    preds, truths = np.asarray(preds, float), np.asarray(truths, float)
+    n_pre = len(preds) if success_step is None else max(0, min(success_step, len(preds)))
+    p, t = preds[:n_pre], truths[:n_pre]
+    err_all = preds - truths
+
+    out = dict(n=len(preds), n_pre_success=len(p),
+               mae_with_tail=float(np.mean(np.abs(err_all))),
+               pred_min=float(preds.min()), pred_max=float(preds.max()))
+    if not len(p):
+        out.update({k: None for k in ("mae", "rmse", "bias", "calibration_slope",
+                                      "monotonicity_rho", "step_slope_error",
+                                      "max_wrong_direction")})
+        return out
+
+    err = p - t
+    out["mae"] = float(np.mean(np.abs(err)))
+    out["rmse"] = float(np.sqrt(np.mean(err ** 2)))
+    out["bias"] = float(np.mean(err))                       # signed: sees an offset
+    out["calibration_slope"] = float(np.polyfit(t, p, 1)[0]) if np.std(t) > 0 else None
+    # honest name: Spearman against the frame index, i.e. "is the curve
+    # decreasing", NOT ranking quality
+    out["monotonicity_rho"] = _corr(spearmanr, p, -np.arange(len(p), dtype=float))
+    if len(p) >= 2:
+        d = -np.diff(p)                                     # predicted decrement
+        out["step_slope_error"] = float(np.mean(np.abs(d - 1.0)))
+        out["max_wrong_direction"] = float(max(np.max(-d), 0.0))
     else:
-        out["pearson_r"] = None
-        out["spearman_rho"] = None
+        out["step_slope_error"] = None
+        out["max_wrong_direction"] = 0.0
     return out
 
 
-def max_wrong_direction(pred_curve):
-    """Largest single-frame *increase* in a predicted countdown — the only
-    direction that's actually concerning for a countdown signal."""
-    if len(pred_curve) < 2:
-        return 0.0
-    return float(np.max(np.diff(pred_curve)))
-
-
-# ---- rollout-based evaluation against held-out POLICIES ------------------
-
-def eval_rollout(predict_fn, policy, seed, max_steps=500, random_policy=False,
-                  stop_after_success=CONFIRM_BUFFER_DEFAULT, deterministic=False):
+def max_wrong_direction(pred_curve, success_step=None):
     """
-    Runs one rollout on the fixed scene using `policy` (never one used to
-    generate training data), recording the model's prediction at every step.
-    predict_fn(obs) -> float prediction, already normalized/clipped by caller.
-    Returns (preds: np.ndarray, success_step: int|None).
-
-    deterministic=False (default) SAMPLES the policy. With the scene pinned
-    and MuJoCo deterministic, deterministic=True made every eval seed produce
-    the SAME trajectory — so "spread across 8 seeds" measured one rollout
-    eight times and the reported std was ~0 by construction, not because the
-    models were stable. Sampling gives genuinely different rollouts, so the
-    std means something.
+    Magnitude of the worst UPWARD jump in a predicted countdown; 0 if it never
+    rises. Pre-success only — the confirm buffer has no countdown left to get
+    wrong, so wobble there used to contaminate this.
     """
-    from env_utils import make_fixed_scene_env  # lazy: sim dependency
+    c = np.asarray(pred_curve, float)
+    if success_step is not None:
+        c = c[:max(0, min(int(success_step), len(c)))]
+    return 0.0 if len(c) < 2 else float(max(np.max(np.diff(c)), 0.0))
 
-    env = make_fixed_scene_env()
-    # Seed the POLICY's action sampling, not just the env reset. With
-    # deterministic=False the actions come from torch's global RNG, so without
-    # this an evaluation is not reproducible: re-running the same models gave
-    # materially different numbers (one combo moved 1.25 -> 2.34 MAE between
-    # two runs). Seeding here keeps rollouts different ACROSS seeds within a
-    # run, but identical across runs of the same seed.
-    if not deterministic:
-        import torch
-        torch.manual_seed(seed)
-        np.random.seed(seed)
 
+def pooled_ranking_metrics(pairs):
+    """
+    Correlations across trajectories, on pooled pre-success (pred, truth).
+
+    Sees a level consistent within each rollout but drifting between them.
+    Does NOT see a global affine error — nothing does; use bias and
+    calibration_slope for that. pairs: (preds, truths, success_step) each.
+    """
+    P, T = [], []
+    for preds, truths, ss in pairs:
+        preds, truths = np.asarray(preds, float), np.asarray(truths, float)
+        n = len(preds) if ss is None else max(0, min(ss, len(preds)))
+        if n:
+            P.append(preds[:n]); T.append(truths[:n])
+    if not P:
+        return dict(pooled_pearson=None, pooled_spearman=None, n_pooled=0)
+    P, T = np.concatenate(P), np.concatenate(T)
+    return dict(pooled_pearson=_corr(pearsonr, P, T),
+                pooled_spearman=_corr(spearmanr, P, T), n_pooled=int(len(P)))
+
+
+# ---- rollouts ------------------------------------------------------------
+
+def _rollout(predict_fn, policy, seed, max_steps=500, stop_after_success=CONFIRM_BUFFER,
+             record_obs=False, record_frames=False):
+    """
+    One rollout on the fixed scene. Returns (preds, success_step, obs, frames).
+
+    success_step is the index of the first state that IS successful (t+1 for a
+    flag returned by the step out of s_t); it used to be recorded as t, making
+    every ground-truth curve a frame short.
+
+    The policy is always SAMPLED: with the scene pinned and MuJoCo
+    deterministic, taking the policy mean made every eval seed produce the
+    SAME trajectory, so "spread across 8 seeds" measured one rollout eight
+    times. Both RNGs are seeded per rollout, so rollouts differ across seeds
+    but are identical across runs of one seed.
+    """
+    import torch
+
+    from env_utils import make_fixed_scene_env
+
+    env = make_fixed_scene_env(render_mode="rgb_array" if record_frames else None)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     obs, _ = env.reset(seed=seed)
-    preds, success = [], None
+
+    preds, obs_list, frames, success_step = [], [], [], None
     for t in range(max_steps):
-        preds.append(predict_fn(obs))
-        action = (env.action_space.sample() if random_policy
-                  else policy.predict(obs, deterministic=deterministic)[0])
-        obs, _, term, trunc, info = env.step(action)
-        if info.get(SUCCESS_KEY, 0) and success is None:
-            success = t
-        if success is not None and t >= success + stop_after_success:
+        if predict_fn is not None:
+            preds.append(float(predict_fn(obs)))
+        if record_obs:
+            obs_list.append(np.asarray(obs, dtype=np.float32).copy())
+        if record_frames:
+            from t2s_video import render_frame  # MuJoCo bottom-up fix
+            frames.append(render_frame(env))
+        action, _ = policy.predict(obs, deterministic=False)
+        obs, _r, term, trunc, info = env.step(action)
+        if info.get(SUCCESS_KEY, 0) and success_step is None:
+            success_step = t + 1
+        if success_step is not None and t >= success_step + stop_after_success:
             break
         if term or trunc:
             break
     env.close()
-    return np.array(preds), success
+    return (np.array(preds), success_step,
+            np.array(obs_list, dtype=np.float32) if record_obs else None,
+            frames if record_frames else None)
 
 
-def run_full_evaluation(predict_fn, eval_success_policy, eval_failure_policy,
-                         n_seeds=8, seed_offset=500, max_steps=500, deterministic=False):
+def run_full_evaluation(predict_fn, success_policy, failure_policy, n_seeds=8,
+                        seed_offset=500, max_steps=500):
     """
-    The stage-4 deliverable: evaluate against policies that generated NONE
-    of the training data. Returns a report dict with per-scenario metrics.
-
-    - "success" scenario: predictions vs. ground-truth steps_remaining
-      (computed from the actual success frame), on rollouts from
-      eval_success_policy, which reliably succeeds but was held out of
-      data collection entirely.
-    - "failure" scenario: same policy family but the held-out policy that
-      reliably fails — there is no ground-truth steps_remaining here (it
-      never reaches 0), so only max_wrong_direction / prediction range are
-      reported, not MAE/correlation.
+    One model's report: per-seed metrics on rollouts of the held-out success
+    policy, prediction ranges on the held-out failure policy (no ground truth
+    exists there), and pooled cross-rollout correlations.
     """
     report = {"success_scenario": [], "failure_scenario": []}
+    pairs = []
 
     for seed in range(seed_offset, seed_offset + n_seeds):
-        preds, success = eval_rollout(predict_fn, eval_success_policy, seed=seed,
-                                       max_steps=max_steps, deterministic=deterministic)
-        if success is None:
-            continue  # this "reliable" policy failed on this seed; skip rather than fabricate ground truth
-        truths = np.array([max(0, success - t) for t in range(len(preds))], dtype=np.float32)
-        m = compute_metrics(preds, truths)
-        m["seed"] = seed
-        m["max_wrong_direction"] = max_wrong_direction(preds)
+        preds, ss, _o, _f = _rollout(predict_fn, success_policy, seed, max_steps)
+        if ss is None:
+            continue        # this "reliable" policy failed here; don't fabricate truth
+        truths = steps_remaining_curve(len(preds), ss)
+        m = compute_metrics(preds, truths, success_step=ss)
+        m.update(seed=seed, success_step=int(ss))
         report["success_scenario"].append(m)
+        pairs.append((preds, truths, ss))
 
     for seed in range(seed_offset, seed_offset + n_seeds):
-        preds, success = eval_rollout(predict_fn, eval_failure_policy, seed=seed,
-                                       max_steps=max_steps, deterministic=deterministic)
+        preds, ss, _o, _f = _rollout(predict_fn, failure_policy, seed, max_steps)
         report["failure_scenario"].append(dict(
-            seed=seed, succeeded_unexpectedly=success is not None,
+            seed=seed, succeeded_unexpectedly=ss is not None,
             pred_min=float(preds.min()), pred_max=float(preds.max()),
-            max_wrong_direction=max_wrong_direction(preds),
-        ))
+            # how far below the censor level it drifts on a trajectory that
+            # never succeeds: the false-optimism magnitude
+            optimism_vs_censor=float(CENSOR_LABEL - preds.min()),
+            max_wrong_direction=max_wrong_direction(preds)))
 
-    succ_rows = report["success_scenario"]
-    if succ_rows:
-        report["success_scenario_summary"] = {
-            k: float(np.mean([r[k] for r in succ_rows if r.get(k) is not None]))
-            for k in ("mae", "rmse", "pearson_r", "spearman_rho", "max_wrong_direction")
-            if any(r.get(k) is not None for r in succ_rows)
-        }
-    report["failure_scenario_summary"] = dict(
-        unexpected_success_rate=float(np.mean([r["succeeded_unexpectedly"] for r in report["failure_scenario"]])),
-    )
+    report["pooled_ranking"] = pooled_ranking_metrics(pairs)
+    rows = report["success_scenario"]
+    if rows:
+        keys = ("mae", "rmse", "mae_with_tail", "bias", "calibration_slope",
+                "monotonicity_rho", "step_slope_error", "max_wrong_direction", "pred_max")
+        report["summary"] = {k: _mean([r.get(k) for r in rows], k) for k in keys}
+        report["summary"].update({k: report["pooled_ranking"][k]
+                                  for k in ("pooled_pearson", "pooled_spearman")})
+    fails = report["failure_scenario"]
+    report["failure_summary"] = dict(
+        unexpected_success_rate=float(np.mean([r["succeeded_unexpectedly"] for r in fails]))
+        if fails else None,
+        mean_pred_min=float(np.mean([r["pred_min"] for r in fails])) if fails else None)
     return report
 
 
+def evaluate_on_val_split(predict_fn, dataset_path, max_rows=50_000, seed=0):
+    """
+    Held-out-ROWS evaluation on the split stored by data_collection. Thousands
+    of states against eight rollouts, and its correlation spans many episodes
+    by construction, so it is the pooled kind.
+    """
+    d = np.load(dataset_path)
+    if "split" not in d.files:
+        raise KeyError(f"{dataset_path} has no 'split' array — re-collect with the "
+                       "current data_collection.")
+    X, y, split = d["X"], d["y_steps"], d["split"].astype(str)
+    # rows from failed episodes carry the censored ceiling, not a true label
+    idx = np.flatnonzero((split == "val") & (y != CENSOR_LABEL))
+    if not len(idx):
+        return dict(n=0, note="val split empty after filtering")
+    if len(idx) > max_rows:
+        idx = np.sort(np.random.default_rng(seed).choice(idx, max_rows, replace=False))
+
+    preds = np.array([predict_fn(o) for o in X[idx]], dtype=float)
+    truths = y[idx].astype(float)
+    err = preds - truths
+    return dict(n=int(len(idx)), mae=float(np.mean(np.abs(err))),
+                bias=float(np.mean(err)),
+                calibration_slope=float(np.polyfit(truths, preds, 1)[0])
+                if np.std(truths) > 0 else None,
+                pooled_pearson=_corr(pearsonr, preds, truths),
+                pooled_spearman=_corr(spearmanr, preds, truths))
+
+
+def collect_eval_trajectories(success_policy, failure_policy, seeds=(500, 501, 502),
+                              max_steps=500, record_frames=False):
+    """
+    Reference rollouts from the held-out policies, for reward_preview and
+    t2s_video. Returns {"success": [traj, ...], "failure": [traj, ...]}.
+
+    SEVERAL seeds, not one. This used to roll out exactly two trajectories
+    with a deterministic policy, and reward_preview computed its go/no-go
+    return_gap from that single pair — model selection on a sample of two.
+    Observations are collected ONCE and every model predicts on the same
+    stored states, so differences between prediction curves are the model.
+    """
+    def roll(policy, seed):
+        _p, ss, obs, frames = _rollout(None, policy, seed, max_steps,
+                                       record_obs=True, record_frames=record_frames)
+        return dict(obs=obs, success_step=ss, seed=seed, frames=frames,
+                    truth=steps_remaining_curve(len(obs), ss) if ss is not None else None)
+
+    return {"success": [roll(success_policy, s) for s in seeds],
+            "failure": [roll(failure_policy, s) for s in seeds]}
+
+
+# ---- reporting -----------------------------------------------------------
+
 def metric_mean_std(report, metric):
-    """
-    (mean, std) for a metric across the per-seed evaluation rollouts.
-
-    success_scenario_summary holds only means, but report["success_scenario"]
-    keeps one entry per seed — so the spread IS recoverable and should be
-    shown. A combo whose MAE is 5.0 +/- 0.3 is a different claim from one at
-    5.0 +/- 4.0, and the bar chart previously hid that distinction entirely.
-    """
-    rows = report.get("success_scenario", [])
-    vals = [r[metric] for r in rows if r.get(metric) is not None]
-    if not vals:
-        # fall back to the summary mean when per-seed detail is unavailable
-        m = report.get("success_scenario_summary", {}).get(metric)
-        return (m, None)
-    return (float(np.mean(vals)), float(np.std(vals)))
-
-
-def metric_values(report, metric):
-    """Per-seed values for a metric (empty list if only a summary exists)."""
-    return [r[metric] for r in report.get("success_scenario", [])
+    """(mean, std) across per-seed rollouts. Pooled metrics have no spread."""
+    if metric.startswith("pooled_"):
+        return (report.get("pooled_ranking", {}).get(metric)
+                or report.get("summary", {}).get(metric), None)
+    vals = [r[metric] for r in report.get("success_scenario", [])
             if r.get(metric) is not None]
+    if not vals:
+        return (report.get("summary", {}).get(metric), None)
+    return (_mean(vals, metric), float(np.std(vals)))
 
 
-def _select_combos(reports, combos=None, exclude=None):
-    """Resolve an explicit include list / exclude list against the report keys."""
-    names = list(reports.keys())
-    if combos is not None:
-        missing = [c for c in combos if c not in reports]
-        if missing:
-            raise KeyError(f"combos not in reports: {missing}. Available: {names}")
-        names = list(combos)
-    if exclude:
-        names = [c for c in names if c not in exclude]
-    if not names:
-        raise ValueError("no combos left to plot after filtering")
-    return names
+def _ordered(reports, sort_by):
+    names = list(reports)
+    if not sort_by:
+        return names
+    higher = sort_by in HIGHER_IS_BETTER or sort_by == "calibration_slope"
+
+    def key(c):
+        m = metric_mean_std(reports[c], sort_by)[0]
+        if m is None:
+            return float("-inf") if higher else float("inf")
+        return -abs(m - 1.0) if sort_by == "calibration_slope" else m    # best is 1.0
+    return sorted(names, key=key, reverse=higher)
 
 
-def plot_combo_comparison(reports, metrics=("mae", "rmse", "spearman_rho", "max_wrong_direction"),
-                           save_path=None, combos=None, exclude=None, show_std=True,
-                           sort_by=None):
-    """
-    Bar chart comparing every combo (e.g. mc_succ, td0_succ, ...) across the
-    given metrics, one subplot per metric. Reads reports[combo]['success_scenario_summary'].
-    Skips a metric entirely if no combo has it (e.g. correlation undefined for
-    degenerate predictions) rather than plotting an empty/misleading panel.
-    """
-    import matplotlib.pyplot as plt
-
-    names = _select_combos(reports, combos, exclude)
-    if sort_by:
-        higher = sort_by in ("pearson_r", "spearman_rho")
-        names.sort(key=lambda c: (metric_mean_std(reports[c], sort_by)[0]
-                                   if metric_mean_std(reports[c], sort_by)[0] is not None
-                                   else (float("-inf") if higher else float("inf"))),
-                    reverse=higher)
-    available_metrics = [
-        m for m in metrics
-        if any(m in reports[c].get("success_scenario_summary", {}) for c in names)
-    ]
-    if not available_metrics:
-        raise ValueError("none of the requested metrics are present in any report's success_scenario_summary")
-
-    fig, axes = plt.subplots(1, len(available_metrics), figsize=(5 * len(available_metrics), 4))
-    if len(available_metrics) == 1:
-        axes = [axes]
-
-    for ax, metric in zip(axes, available_metrics):
-        stats = [metric_mean_std(reports[c], metric) for c in names]
-        values = [np.nan if m is None else m for m, _sd in stats]
-        errs = [0.0 if sd is None else sd for _m, sd in stats] if show_std else None
-
-        bars = ax.bar(names, values, yerr=errs, capsize=4, color="tab:blue",
-                       error_kw=dict(ecolor="0.25", lw=1.2))
-        if show_std:
-            # error bars alone are invisible when the spread is small relative
-            # to the bar height, so also draw every seed as a dot and print the
-            # number — a tiny bar with +/-0.02 and one with +/-2.0 must not look
-            # the same.
-            for xi, c in enumerate(names):
-                pts = metric_values(reports[c], metric)
-                if pts:
-                    ax.scatter([xi] * len(pts), pts, s=14, color="black",
-                                zorder=3, alpha=0.75)
-            tops = []
-            for xi, ((mean, sd), c) in enumerate(zip(stats, names)):
-                if mean is None:
-                    continue
-                pts = metric_values(reports[c], metric)
-                # clear the error bar AND the highest seed dot
-                y = max([mean + (sd or 0.0)] + pts)
-                tops.append(y)
-            headroom = max(tops, default=1.0)
-            for xi, ((mean, sd), c) in enumerate(zip(stats, names)):
-                if mean is None:
-                    continue
-                pts = metric_values(reports[c], metric)
-                y = max([mean + (sd or 0.0)] + pts)
-                label = f"{mean:.2f}" + (f"\n±{sd:.2f}" if sd is not None else "")
-                ax.text(xi, y + 0.03 * headroom, label, ha="center", va="bottom",
-                         fontsize=7.5)
-            ax.set_ylim(top=headroom * 1.30)
-        # highlight the best combo for this metric (lower is better, except correlations)
-        higher_is_better = metric in ("pearson_r", "spearman_rho")
-        finite = [v for v in values if not np.isnan(v)]
-        if finite:
-            best_val = max(finite) if higher_is_better else min(finite)
-            winners = [v for v in values if v == best_val]
-            # a metric where every combo ties (e.g. correlations all at 0.98)
-            # has no winner — colouring them all green implies a distinction
-            # the numbers do not support
-            if len(winners) < len(finite):
-                for bar, v in zip(bars, values):
-                    if v == best_val:
-                        bar.set_color("tab:green")
-        ax.set_title(metric + ("  (mean ± std over seeds)" if show_std else ""))
-        ax.set_xticks(range(len(names)))
-        ax.set_xticklabels(names, rotation=45, ha="right", fontsize=8)
-        ax.axhline(0, color="gray", lw=0.5)
-        ax.grid(axis="y", alpha=0.3)
-
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.show()
-    return fig
+LEGEND = """
+mae/bias          : pre-success frames only (mae_with_tail keeps the confirm buffer)
+bias              : signed; NEGATIVE = claims success is nearer than it is
+calibration_slope : 1.0 is correct; no correlation can see a wrong scale
+step_slope_error  : mean |predicted decrement - 1|; what the shaped reward consumes
+pooled_spearman   : ACROSS trajectories — sees level drift between rollouts
+monotonicity_rho  : WITHIN trajectory vs frame index; ~0.99 for any decreasing curve"""
 
 
-def collect_eval_trajectories(eval_success_policy, eval_failure_policy, seed=500, max_steps=500,
-                               stop_after_success=CONFIRM_BUFFER_DEFAULT):
-    """
-    Rolls out exactly TWO reference trajectories — one from the held-out
-    success policy, one from the held-out failure policy — and returns their
-    raw observations plus ground truth.
-
-    Deliberately separated from prediction: the observations are collected
-    ONCE, then every model predicts on these same stored states (see
-    plot_sample_trajectories). If each model rolled out its own trajectory,
-    differences between the prediction curves would be confounded by
-    differences in the trajectories themselves, and the comparison would be
-    meaningless.
-
-    Returns {"success": traj, "failure": traj} where traj is a dict with
-    "obs" (T, obs_dim), "success_step" (int|None), "truth" (T,) or None.
-    """
-    from env_utils import make_fixed_scene_env
-
-    def _roll(policy, seed):
-        env = make_fixed_scene_env()
-        obs, _ = env.reset(seed=seed)
-        obs_list, success_step = [], None
-        for t in range(max_steps):
-            obs_list.append(obs.copy())
-            action, _ = policy.predict(obs, deterministic=True)
-            obs, _r, term, trunc, info = env.step(action)
-            if info.get(SUCCESS_KEY, 0) and success_step is None:
-                success_step = t
-            if success_step is not None and t >= success_step + stop_after_success:
-                break
-            if term or trunc:
-                break
-        env.close()
-        obs_arr = np.array(obs_list, dtype=np.float32)
-        truth = (np.array([max(0, success_step - t) for t in range(len(obs_arr))], dtype=np.float32)
-                 if success_step is not None else None)
-        return dict(obs=obs_arr, success_step=success_step, truth=truth)
-
-    return {
-        "success": _roll(eval_success_policy, seed),
-        "failure": _roll(eval_failure_policy, seed),
-    }
-
-
-def plot_sample_trajectories(trajectories, predictors, save_path=None, censor_label=300.0):
-    """
-    Two side-by-side panels (success trajectory, failure trajectory), with
-    EVERY model's prediction overlaid on the same states, plus ground truth.
-
-    trajectories: output of collect_eval_trajectories.
-    predictors: {combo_name: predict_fn} — each predict_fn(obs) -> float,
-        e.g. from t2s_predict.load_t2s_predictor.
-
-    What to look for:
-      - Success panel: a usable model tracks the dashed ground-truth line
-        downward and reaches ~0 at the success marker. Flat lines, or curves
-        that never descend, mean the model isn't tracking progress at all.
-      - Failure panel: there is no ground truth (success never happens), so
-        the useful signal is whether predictions stay HIGH. A model that
-        confidently predicts "almost there" throughout a failing trajectory
-        is actively misleading as a reward, even with a good MAE on
-        successful rollouts.
-    """
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5), sharey=True)
-    colors = plt.cm.tab10.colors
-
-    for ax, (scenario, traj) in zip(axes, trajectories.items()):
-        obs = traj["obs"]
-        for i, (combo, predict_fn) in enumerate(predictors.items()):
-            preds = np.array([predict_fn(o) for o in obs], dtype=np.float32)
-            ax.plot(preds, color=colors[i % len(colors)], label=combo, linewidth=1.6)
-
-        if traj["truth"] is not None:
-            ax.plot(traj["truth"], color="black", linestyle="--", linewidth=2, label="ground truth")
-        if traj["success_step"] is not None:
-            ax.axvline(traj["success_step"], color="black", alpha=0.3, linewidth=1)
-            ax.annotate("success", (traj["success_step"], ax.get_ylim()[1] * 0.9),
-                         fontsize=8, rotation=90, va="top")
-        else:
-            ax.axhline(censor_label, color="gray", linestyle=":", linewidth=1,
-                        label=f"censor label ({censor_label:.0f})")
-
-        n_steps = len(obs)
-        ax.set_title(f"{scenario} trajectory "
-                      f"({'succeeded at ' + str(traj['success_step']) if traj['success_step'] is not None else 'never succeeded'}"
-                      f", {n_steps} steps)")
-        ax.set_xlabel("step")
-        ax.grid(alpha=0.3)
-
-    axes[0].set_ylabel("predicted steps remaining")
-    axes[0].legend(fontsize=8)
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.show()
-    return fig
-
-
-def format_report_table(reports, metrics=("mae", "rmse", "pearson_r", "spearman_rho", "max_wrong_direction"),
-                         combos=None, exclude=None, show_std=True, sort_by=None):
-    """
-    Pure-string comparison table across combos and metrics — no matplotlib,
-    so this is unit-testable and also useful for logging/console output
-    where a plot isn't practical. Returns the table as a single string;
-    print it yourself (kept as a pure function rather than printing directly
-    so it's testable and reusable for writing to a log file).
-    """
+def format_report_table(reports, metrics=REPORT_METRICS, sort_by="mae", show_std=True):
+    """Pure-string comparison table. No matplotlib, so it works headless."""
     if not reports:
         return "(no reports)"
-    names = _select_combos(reports, combos, exclude)
-    if sort_by:
-        higher = sort_by in ("pearson_r", "spearman_rho")
-        names.sort(key=lambda c: (metric_mean_std(reports[c], sort_by)[0]
-                                   if metric_mean_std(reports[c], sort_by)[0] is not None
-                                   else (float("-inf") if higher else float("inf"))),
-                    reverse=higher)
+    names = _ordered(reports, sort_by)
+    cols = [m for m in metrics
+            if any(metric_mean_std(reports[c], m)[0] is not None for c in names)]
+    if not cols:
+        return "(no metrics available)"
 
-    available_metrics = [
-        m for m in metrics
-        if any(m in reports[c].get("success_scenario_summary", {}) for c in names)
-    ]
-    if not available_metrics:
-        return "(no metrics available in any report's success_scenario_summary)"
-
-    col_w = 18 if show_std else 14
-    header = f"{'combo':<18}" + "".join(f"{m[:col_w]:>{col_w}}" for m in available_metrics)
+    w = 18 if show_std else 14
+    header = f"{'combo':<20}" + "".join(f"{m[:w]:>{w}}" for m in cols)
     lines = [header, "-" * len(header)]
     for c in names:
-        row = f"{c:<18}"
-        for m in available_metrics:
+        row = f"{c:<20}"
+        for m in cols:
             mean, sd = metric_mean_std(reports[c], m)
             if mean is None:
-                row += f"{'--':>{col_w}}"
+                row += f"{'--':>{w}}"
             elif show_std and sd is not None:
-                row += f"{mean:>{col_w - 7}.3f} ±{sd:<5.3f}"
+                row += f"{mean:>{w - 7}.3f} ±{sd:<5.3f}"
             else:
-                row += f"{mean:>{col_w}.4f}"
+                row += f"{mean:>{w}.4f}"
         lines.append(row)
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n" + LEGEND
 
 
-
-def evaluate_runs(t2s_runs, eval_success_policy, eval_failure_policy,
-                   combos=None, n_seeds=8, seed_offset=500, deterministic=False,
-                   verbose=True, **eval_kwargs):
+def plot_combo_comparison(reports, metrics=REPORT_METRICS, save_path=None, sort_by="mae"):
     """
-    Evaluate the SAME combo names across SEVERAL t2s_model runs, in one table.
+    One subplot per metric. Every seed is drawn as a dot as well as an error
+    bar, because error bars alone are invisible when the spread is small
+    relative to the bar height — a bar with +/-0.02 must not look like one
+    with +/-2.0.
+    """
+    import matplotlib.pyplot as plt
 
-    Needed because combo names repeat across runs: a gamma probe trained with
-    censor_schemes=('censor',) produces "tdlambda_succ", exactly the name the
-    main run already uses. Without a per-run label the second would silently
-    overwrite the first in the reports dict.
+    names = _ordered(reports, sort_by)
+    cols = [m for m in metrics
+            if any(metric_mean_std(reports[c], m)[0] is not None for c in names)]
+    if not cols:
+        raise ValueError("none of the requested metrics are present")
 
-    t2s_runs: {label: (run_dir, summary_rows)}. The label is appended to each
-        combo name, so an empty label leaves names unchanged. Example:
+    fig, axes = plt.subplots(1, len(cols), figsize=(4.6 * len(cols), 4.2))
+    axes = np.atleast_1d(axes)
 
-            evaluate_runs({
-                '':     (t2s_run_dir, summary_rows),   # main run, gamma=1.0 censor
-                '_g99': (probe_dir,   probe_rows),     # same combos at gamma=0.99
-            }, eval_success_pol, eval_failure_pol)
+    for ax, metric in zip(axes, cols):
+        stats = [metric_mean_std(reports[c], metric) for c in names]
+        values = [np.nan if m is None else m for m, _ in stats]
+        errs = [sd or 0.0 for _, sd in stats]
+        bars = ax.bar(range(len(names)), values, yerr=errs, capsize=4, color="tab:blue")
 
-        gives 'tdlambda_succ' and 'tdlambda_succ_g99' side by side.
+        for xi, c in enumerate(names):
+            pts = [r[metric] for r in reports[c].get("success_scenario", [])
+                   if r.get(metric) is not None]
+            if pts:
+                ax.scatter([xi] * len(pts), pts, s=14, color="black", zorder=3, alpha=.75)
 
-    combos: optional list of combo names to evaluate from each run; None = all.
+        finite = [v for v in values if not np.isnan(v)]
+        if finite:
+            best = (min(finite, key=lambda v: abs(v - 1.0)) if metric == "calibration_slope"
+                    else max(finite) if metric in HIGHER_IS_BETTER else min(finite))
+            # a metric where every combo ties has no winner; colouring them all
+            # green implies a distinction the numbers do not support
+            if sum(v == best for v in values) < len(finite):
+                for bar, v in zip(bars, values):
+                    if v == best:
+                        bar.set_color("tab:green")
+        if metric == "calibration_slope":
+            ax.axhline(1.0, color="tab:red", ls="--", lw=1)
+        ax.set_title(metric, fontsize=9)
+        ax.set_xticks(range(len(names)))
+        ax.set_xticklabels(names, rotation=45, ha="right", fontsize=8)
+        ax.grid(axis="y", alpha=.3)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    return fig
+
+
+def evaluate_runs(t2s_run_dir, summary_rows, success_policy, failure_policy,
+                  n_seeds=8, dataset_path=None, verbose=True):
+    """
+    Evaluate every combo in one t2s_model run. Returns {combo: report}.
+
+    dataset_path also runs the held-out-ROWS evaluation and attaches it as
+    report["val_split"] — worth doing, since 8 rollouts is thin.
     """
     import t2s_predict
 
     reports = {}
-    for label, (run_dir, rows) in t2s_runs.items():
-        wanted = rows if combos is None else [r for r in rows if r["combo"] in combos]
-        if combos is not None and len(wanted) != len(combos):
-            missing = set(combos) - {r["combo"] for r in wanted}
-            raise KeyError(f"run {label or '(main)'} is missing combos: {sorted(missing)}")
-        for row in wanted:
-            method, condition = row["combo"].rsplit("_", 1)
-            key = row["combo"] + label
-            if verbose:
-                print(f"  evaluating {key} ...", flush=True)
-            predict_fn = t2s_predict.load_t2s_predictor(
-                run_dir, method, condition, seed=row["best_seed"])
-            reports[key] = run_full_evaluation(
-                predict_fn, eval_success_policy, eval_failure_policy,
-                n_seeds=n_seeds, seed_offset=seed_offset,
-                deterministic=deterministic, **eval_kwargs)
+    for row in summary_rows:
+        method, condition = row["combo"].rsplit("_", 1)
+        if verbose:
+            print(f"  evaluating {row['combo']} ...", flush=True)
+        fn = t2s_predict.load_t2s_predictor(t2s_run_dir, method, condition,
+                                            seed=row["best_seed"])
+        rep = run_full_evaluation(fn, success_policy, failure_policy, n_seeds=n_seeds)
+        if dataset_path:
+            rep["val_split"] = evaluate_on_val_split(fn, dataset_path)
+        reports[row["combo"]] = rep
     return reports

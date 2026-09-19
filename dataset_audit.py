@@ -151,10 +151,6 @@ def check_trajectory_uniqueness(X, episode_ids):
     bit-identical no matter what seed reset() got. Measured once at 222
     episodes -> 93 unique (58% duplicates), concentrated in exactly the
     expert rollouts the "succ" condition trains on.
-
-    Duplicates also break the train/val split: GroupShuffleSplit groups by
-    episode_ids, not by content, so identical trajectories with different
-    ids can land on both sides and make val MSE meaningless.
     """
     sigs = [hash(X[np.flatnonzero(episode_ids == e)].tobytes())
             for e in np.unique(episode_ids)]
@@ -166,6 +162,58 @@ def check_trajectory_uniqueness(X, episode_ids):
         verdict=("OK" if frac < 0.05 else
                   f"{frac:.0%} DUPLICATES — set deterministic=False and use "
                   "multiple collection_seeds"),
+    )
+
+
+def check_split_integrity(X, y, episode_ids, split, censor_label=CENSOR_LABEL):
+    """
+    Audit the train/val split stored by data_collection.
+
+    Three ways a split can be useless here, all seen in this project:
+      1. the same trajectory CONTENT on both sides. GroupShuffleSplit grouped
+         by episode id, and this dataset's rollouts were 58% duplicates, so
+         identical trajectories with different ids straddled the split and val
+         MSE partly measured memorization. assign_splits routes duplicates to
+         one side; this verifies it.
+      2. an episode straddling the split (rows of one episode on both sides),
+         which leaks adjacent near-identical states whose labels differ by 1.
+      3. val with no FAILED episodes, which makes the succ/all condition
+         comparison unvalidatable.
+    """
+    split = np.asarray(split).astype(str)
+    straddling, sig_sides = [], {}
+    val_failed = val_succ = 0
+    for ep, idx in _episode_slices(episode_ids):
+        sides = set(split[idx])
+        if len(sides) > 1:
+            straddling.append(int(ep))
+        side = sorted(sides)[0]
+        sig = hash(X[idx].tobytes())
+        sig_sides.setdefault(sig, set()).add(side)
+        if side == "val":
+            if np.all(y[idx] == censor_label):
+                val_failed += 1
+            else:
+                val_succ += 1
+    leaked = [s for s, sides in sig_sides.items() if len(sides) > 1]
+    n_val_rows = int(np.sum(split == "val"))
+    problems = []
+    if leaked:
+        problems.append(f"{len(leaked)} duplicate trajectory group(s) on BOTH sides")
+    if straddling:
+        problems.append(f"{len(straddling)} episode(s) straddling the split")
+    if n_val_rows == 0:
+        problems.append("val split is empty")
+    if val_failed == 0:
+        problems.append("val has no failed episodes")
+    return dict(
+        val_rows=n_val_rows, train_rows=int(np.sum(split == "train")),
+        val_row_fraction=float(n_val_rows / len(split)) if len(split) else 0.0,
+        val_successful_episodes=val_succ, val_failed_episodes=val_failed,
+        duplicate_groups_spanning_split=len(leaked),
+        episodes_straddling_split=len(straddling),
+        straddling_examples=straddling[:5],
+        verdict="OK" if not problems else "LEAK/GAP — " + "; ".join(problems),
     )
 
 
@@ -201,6 +249,7 @@ def audit_dataset(dataset_path, summary_path=None, verbose=True):
     d = np.load(dataset_path)
     X, y = d["X"], d["y_steps"]
     episode_ids = d["episode_ids"]
+    split = d["split"] if "split" in d.files else None
 
     report = dict(
         path=dataset_path,
@@ -213,6 +262,11 @@ def audit_dataset(dataset_path, summary_path=None, verbose=True):
         object_movement=check_object_movement(X, episode_ids),
         label_sanity=check_label_sanity(y, episode_ids),
     )
+    report["split_integrity"] = (
+        check_split_integrity(X, y, episode_ids, split)
+        if split is not None else
+        dict(verdict="MISSING — dataset has no 'split' array; re-collect with the "
+                     "current data_collection so train/val is fixed at collection time"))
 
     if summary_path and os.path.exists(summary_path):
         with open(summary_path) as f:
@@ -238,6 +292,7 @@ def format_audit(report):
         ("exploration_coverage", "exploration-region coverage"),
         ("object_movement", "object manipulation"),
         ("label_sanity", "label sanity"),
+        ("split_integrity", "train/val split"),
     ]
     for key, label in order:
         sec = report[key]

@@ -10,7 +10,6 @@ exactly one definition.
 """
 import os
 import pickle
-
 import gymnasium as gym
 import metaworld  # noqa: F401  (registers the Meta-World envs)
 

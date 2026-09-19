@@ -10,6 +10,15 @@ Ported from Compare_value_targets_v3.ipynb, decoupled into:
 Import torch lazily-at-module-level is fine here since this module is only
 ever used where torch is installed (unlike t2s_targets/data_collection which
 are also imported by lightweight unit tests).
+
+THE TRAIN/VAL SPLIT IS NO LONGER DRAWN HERE. load_and_prepare used to call
+GroupShuffleSplit(random_state=seed) on whatever pool it was handed. That
+grouped by episode id rather than trajectory CONTENT, so the dataset's
+bit-identical duplicates (222 episodes -> 93 unique) landed on both sides and
+val MSE partly measured memorization; and it was re-drawn per call, so no two
+runs validated on the same states. The split is now assigned once at
+collection time and stored in dataset.npz; this module reads it. See
+data_collection.assign_splits.
 """
 import copy
 import os
@@ -17,31 +26,53 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.model_selection import GroupShuffleSplit
-
-from config import CENSOR_LABEL, OBS_DIM
+from config import CENSOR_LABEL, OBS_DIM, T2S_BOOTSTRAP_GAMMA
 from t2s_model import T2SModel
 from t2s_io import save_normalization, save_manifest, checkpoint_name
 from t2s_targets import build_targets, build_bookkeeping
 
-DEFAULT_EPOCHS = 400
-DEFAULT_PATIENCE = 100
-DEFAULT_TARGET_REFRESH = 5
-DEFAULT_GAMMA = 1.0
-DEFAULT_LAMBDA = 0.9
-DEFAULT_BATCH_SIZE = 256
+# ---- tuning constants: edit here, not via arguments --------------------
+# train_one used to take 15 parameters. Nine of them were these, threaded
+# through run_all_combos and a CLI flag each, none of them a decision anyone
+# made per run.
+EPOCHS = 150                 # val MSE plateaus well before 400
+PATIENCE = 40
+TARGET_REFRESH = 5           # epochs between target-network refreshes
+LAMBDA = 0.9                 # TD(lambda) trace
+BATCH_SIZE = 1024            # 256 underuses the GPU
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+CONFIRM_BUFFER = 20          # frames kept after success when trimming the tail
+CENSOR_GAMMA = 1.0           # censor scheme only; bootstrap forces < 1
+SEED = 0                     # one seed: see run_all_combos for why not a sweep
+
+# the grid IS the experiment: three value targets x two data sources x
+# bootstrap-or-not = 12 models
+METHODS = ("mc", "td0", "tdlambda")
+CONDITIONS = ("succ", "all")
+CENSOR_SCHEMES = ("censor", "bootstrap")
 
 
-def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=20, test_size=0.15,
-                      seed=0, censor_bootstrap=False):
+def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=CONFIRM_BUFFER,
+                     censor_bootstrap=False):
     """
-    Loads dataset.npz, trims the long flat post-success tail, builds the
-    train/val split (grouped by episode so no episode leaks across the
-    split), and returns everything build_targets/train_one need.
+    Loads dataset.npz, trims the long flat post-success tail, reads the STORED
+    train/val split, and returns everything build_targets/train_one need.
+
+    Requires the `split` array written by the current data_collection. A
+    dataset without it predates collection-time splitting and is rejected
+    rather than silently re-split here, which is the behaviour that let two
+    runs disagree about what "validation" meant.
     """
     raw = np.load(dataset_path)
     X_all, y_all = raw["X"], raw["y_steps"]
-    stage_all, episode_ids_all, frame_idxs_all = raw["stage"], raw["episode_ids"], raw["frame_idxs"]
+    episode_ids_all, frame_idxs_all = raw["episode_ids"], raw["frame_idxs"]
+    if "split" not in raw.files:
+        raise KeyError(
+            f"{dataset_path} has no 'split' array (found {list(raw.files)}). Re-collect "
+            "with the current data_collection, which assigns train/val at collection "
+            "time — see its module docstring for why the split moved out of this file.")
+    split_all = raw["split"].astype(str)
 
     is_failed_episode = np.array([
         np.all(y_all[episode_ids_all == ep] == censor_label) for ep in episode_ids_all
@@ -65,13 +96,18 @@ def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=20,
     X_all, y_all = X_all[keep], y_all[keep]
     episode_ids_all, frame_idxs_all = episode_ids_all[keep], frame_idxs_all[keep]
     is_failed_episode = is_failed_episode[keep]
+    split_all = split_all[keep]
 
     next_obs_all, is_terminal_all, terminal_value_all, is_truncated_all = build_bookkeeping(
         X_all, y_all, episode_ids_all, frame_idxs_all, censor_label,
         censor_bootstrap=censor_bootstrap)
 
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-    tr_all, va_all = next(gss.split(X_all, y_all, groups=episode_ids_all))
+    tr_all = np.flatnonzero(split_all == "train")
+    va_all = np.flatnonzero(split_all == "val")
+    if len(va_all) == 0:
+        raise ValueError(
+            f"{dataset_path} has no rows in the 'val' split; re-collect with "
+            "val_fraction > 0.")
 
     succ_mask = ~is_failed_episode
     tr_succ = tr_all[succ_mask[tr_all]]
@@ -85,7 +121,7 @@ def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=20,
         return ((X - x_mean) / x_std).astype(np.float32)
 
     return dict(
-        X_all=X_all, y_all=y_all, next_obs_n_all=normalize(next_obs_all),
+        X_all=X_all, y_all=y_all, split_all=split_all, next_obs_n_all=normalize(next_obs_all),
         Xn_all=normalize(X_all), is_terminal_all=is_terminal_all,
         terminal_value_all=terminal_value_all, is_truncated_all=is_truncated_all,
         censor_bootstrap=censor_bootstrap, episode_ids_all=episode_ids_all,
@@ -98,11 +134,15 @@ def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=20,
     )
 
 
-def train_one(prepared, method, condition, run_dir, seed=0, obs_dim=OBS_DIM,
-              censor_bootstrap=None,
-              epochs=DEFAULT_EPOCHS, patience=DEFAULT_PATIENCE,
-              target_refresh=DEFAULT_TARGET_REFRESH, gamma=DEFAULT_GAMMA, lam=DEFAULT_LAMBDA,
-              target_clip=None, batch_size=DEFAULT_BATCH_SIZE, device="cpu"):
+def train_one(prepared, method, condition, run_dir, seed=0, gamma=CENSOR_GAMMA,
+              target_clip=None, device="cpu", censor_bootstrap=None):
+    """
+    Train one (method, condition) model. Tuning lives in the constants above;
+    only the things that vary per combo are arguments.
+    """
+    obs_dim, epochs, patience = OBS_DIM, EPOCHS, PATIENCE
+    target_refresh, lam, batch_size = TARGET_REFRESH, LAMBDA, BATCH_SIZE
+
     if censor_bootstrap is None:
         censor_bootstrap = prepared.get("censor_bootstrap", False)
     if censor_bootstrap and gamma >= 1.0:
@@ -128,7 +168,7 @@ def train_one(prepared, method, condition, run_dir, seed=0, obs_dim=OBS_DIM,
 
     model = T2SModel(obs_dim=obs_dim).to(device)
     target_net = copy.deepcopy(model)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    opt = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
     Xn_all, y_all = prepared["Xn_all"], prepared["y_all"]
     Xn_tr = Xn_all[rows_tr]
@@ -205,89 +245,93 @@ def train_one(prepared, method, condition, run_dir, seed=0, obs_dim=OBS_DIM,
     return model, np.array(hist), best
 
 
-def run_all_combos(run_dir, dataset_path, methods=("mc", "td0", "tdlambda"),
-                    conditions=("succ", "all"), seeds=(0,), obs_dim=OBS_DIM,
-                    censor_label=CENSOR_LABEL, device="cpu",
-                    censor_schemes=("censor",), bootstrap_gamma=0.99, **train_kwargs):
+def run_all_combos(run_dir, dataset_path, methods=METHODS, conditions=CONDITIONS,
+                   censor_schemes=CENSOR_SCHEMES, bootstrap_gamma=T2S_BOOTSTRAP_GAMMA,
+                   seed=SEED, device="cpu", verbose=True):
     """
-    Full multi-combo, multi-seed sweep. Saves normalization.npz + manifest.json.
+    Train every (method x condition x censor_scheme) combination once.
+    Saves normalization.npz + manifest.json. Returns (models, histories, rows).
 
-    censor_schemes: which failed-episode handling to train. Any of:
-        "censor"    — truncated frame supervised with censor_label (original)
-        "bootstrap" — truncated frame unsupervised, bootstrapped through
-                      (value bootstrap; forces gamma=bootstrap_gamma < 1)
-    Passing both trains each method/condition under both schemes and names the
-    bootstrap variants "<method>boot_<condition>", so Stage 4 ranks them side
-    by side instead of you having to trust that the change helped.
+    ONE SEED, NOT A SWEEP. The scene is pinned, the dataset is fixed, and the
+    split is fixed at collection time, so a second training seed varies only
+    network initialisation and batch order. That is a measure of optimiser
+    noise, not of which value-target formulation is better — and averaging it
+    into `mean_val_mse` made the seed loop look like evidence it was not.
+    Seeds earn their keep in Stage 4 (rollouts differ) and in the RL sweep
+    (exploration differs); here they cost 3x the compute for a number nobody
+    was reading. Set `seed` if you want a different draw.
 
-    Note the two schemes need DIFFERENT preprocessing (build_bookkeeping marks
+    The grid is the actual experiment:
+        methods         mc | td0 | tdlambda      (the three value targets)
+        conditions      succ | all               (the two data sources)
+        censor_schemes  censor | bootstrap       (value bootstrap or not)
+    = 12 models, named "<method>[boot]_<condition>".
+
+    censor   truncated frame supervised with censor_label, i.e. asserts the
+             unknown time-to-success is 300
+    bootstrap truncated frame unsupervised and bootstrapped through; forces
+             gamma < 1, since V = dt + V has no finite fixed point at gamma=1
+
+    The two schemes need DIFFERENT preprocessing (build_bookkeeping marks
     truncated frames differently), so each gets its own `prepared`.
     """
     assert all(cs in ("censor", "bootstrap") for cs in censor_schemes), censor_schemes
-    target_clip = train_kwargs.pop("target_clip", censor_label * 1.2)
-    base_gamma = train_kwargs.pop("gamma", DEFAULT_GAMMA)
+    target_clip = CENSOR_LABEL * 1.2
 
     prepared_by_scheme = {
-        cs: load_and_prepare(dataset_path, censor_label=censor_label,
-                              censor_bootstrap=(cs == "bootstrap"))
-        for cs in censor_schemes
-    }
-    prepared = prepared_by_scheme[censor_schemes[0]]   # for normalization stats
+        cs: load_and_prepare(dataset_path, censor_label=CENSOR_LABEL,
+                             censor_bootstrap=(cs == "bootstrap"))
+        for cs in censor_schemes}
+    prepared = prepared_by_scheme[censor_schemes[0]]      # for normalization stats
 
+    n_total = len(censor_schemes) * len(methods) * len(conditions)
     models, histories, summary_rows = {}, {}, []
+    i = 0
     for scheme in censor_schemes:
         prep = prepared_by_scheme[scheme]
         boot = scheme == "bootstrap"
         # gamma=1 has no finite fixed point once the truncated anchor is removed
-        gamma = bootstrap_gamma if boot else base_gamma
+        gamma = bootstrap_gamma if boot else CENSOR_GAMMA
         for method in methods:
             for condition in conditions:
-                key = f"{method}{'boot' if boot else ''}_{condition}"
-                seed_mses = []
-                best_model, best_hist, best_mse = None, None, float("inf")
-                for sd in seeds:
-                    m, h, mse = train_one(prep, method, condition, run_dir, seed=sd,
-                                           obs_dim=obs_dim, target_clip=target_clip,
-                                           device=device, gamma=gamma,
-                                           censor_bootstrap=boot, **train_kwargs)
-                    seed_mses.append(mse)
-                    if mse < best_mse:
-                        best_model, best_hist, best_mse = m, h, mse
-                models[key] = best_model
-                histories[key] = best_hist
-                succ_at_best = float(best_hist[np.argmin(best_hist[:, 1]), 2])
+                i += 1
+                combo = f"{method}{'boot' if boot else ''}_{condition}"
+                if verbose:
+                    print(f"  [{i}/{n_total}] {combo} (gamma={gamma})", flush=True)
+                model, hist, val_mse = train_one(
+                    prep, method, condition, run_dir, seed=seed,
+                    target_clip=target_clip, device=device, gamma=gamma,
+                    censor_bootstrap=boot)
+                models[combo] = model
+                histories[combo] = hist
                 summary_rows.append(dict(
-                    combo=key, mean_val_mse=float(np.mean(seed_mses)),
-                    std_val_mse=float(np.std(seed_mses)),
-                    seeds_val_mse=[float(v) for v in seed_mses],
-                    mean_val_mse_succ_only=succ_at_best,
-                    best_seed=int(seeds[int(np.argmin(seed_mses))]),
-                    censor_scheme=scheme, gamma=gamma,
-                ))
+                    combo=combo, method=method, condition=condition,
+                    censor_scheme=scheme, gamma=gamma, seed=seed,
+                    val_mse=float(val_mse),
+                    # val MSE restricted to rows from SUCCESSFUL episodes, at the
+                    # epoch that minimised overall val MSE. Failed-episode rows
+                    # carry a censored label, so the overall number partly scores
+                    # agreement with a fiction.
+                    val_mse_succ_only=float(hist[np.argmin(hist[:, 1]), 2]),
+                    # every consumer needs a seed to build the checkpoint filename
+                    best_seed=seed))
 
-    # NOTE on y_mean/y_std: T2SModel is trained directly against raw
-    # steps-remaining targets (see build_targets — nothing normalizes y
-    # before the MSE loss). The policy-training notebook's predict_t2s(),
-    # however, unnormalizes the model's output via `* Y_STD + Y_MEAN`,
-    # which only makes sense if y WAS normalized during training. It
-    # wasn't (that's bug #3 — see chat). Until/unless target normalization
-    # is actually added to train_one, y_mean/y_std must be the identity
-    # (0, 1) so predict.py's rescale step is a no-op and matches what the
-    # model actually learned.
-    save_normalization(run_dir, prepared["x_mean"], prepared["x_std"], 0.0, 1.0)
+    # y is NOT normalized anywhere in this module — build_targets feeds raw
+    # steps-remaining straight into the MSE loss — and t2s_predict no longer
+    # rescales, so there are no y statistics to store. See t2s_io.
+    save_normalization(run_dir, prepared["x_mean"], prepared["x_std"])
 
     manifest = dict(
-        obs_dim=obs_dim, seeds=list(seeds), target_clip=target_clip,
+        obs_dim=OBS_DIM, seed=seed, target_clip=target_clip,
         normalization_file="normalization.npz",
         censor_schemes=list(censor_schemes), bootstrap_gamma=bootstrap_gamma,
-        combos={row["combo"]: dict(
-            method=row["combo"].rsplit("_", 1)[0], condition=row["combo"].rsplit("_", 1)[1],
-            censor_scheme=row["censor_scheme"], gamma=row["gamma"],
-            per_seed_checkpoints=[checkpoint_name(*row["combo"].rsplit("_", 1), sd) for sd in seeds],
-            per_seed_val_mse=row["seeds_val_mse"], mean_val_mse=row["mean_val_mse"],
-            std_val_mse=row["std_val_mse"], mean_val_mse_succ_only=row["mean_val_mse_succ_only"],
-            best_seed=row["best_seed"],
-        ) for row in summary_rows},
-    )
+        combos={r["combo"]: dict(
+            method=r["method"], condition=r["condition"],
+            censor_scheme=r["censor_scheme"], gamma=r["gamma"],
+            checkpoint=checkpoint_name(
+                f"{r['method']}{'boot' if r['censor_scheme'] == 'bootstrap' else ''}",
+                r["condition"], seed),
+            val_mse=r["val_mse"], val_mse_succ_only=r["val_mse_succ_only"],
+            best_seed=seed) for r in summary_rows})
     save_manifest(run_dir, manifest)
     return models, histories, summary_rows
