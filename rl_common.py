@@ -79,17 +79,46 @@ class SuccessRateCallback(BaseCallback):
             import torch
             torch.manual_seed(seed)
         obs_list, success_step = [], None
+        preds, rewards = [], []
         for t in range(self.max_ep_steps):
             obs_list.append(np.asarray(obs, dtype=np.float32).copy())
             action, _ = self.model.predict(obs, deterministic=self.eval_deterministic)
             obs, _reward, terminated, truncated, info = self.eval_env.step(action)
+            # Time2SuccessRewardWrapper publishes these and nothing was reading
+            # them. They are the only in-training view of the REWARD ITSELF:
+            # success_rate says whether the task was solved, these say what the
+            # policy was being paid while it wasn't.
+            if "t2s_pred" in info:
+                preds.append(float(info["t2s_pred"]))
+            if "t2s_reward" in info:
+                rewards.append(float(info["t2s_reward"]))
             if info.get(SUCCESS_KEY, 0) and success_step is None:
                 success_step = t + 1        # the state AFTER this step is the successful one
             if terminated or truncated:
                 break
         # record the final state so index success_step always exists
         obs_list.append(np.asarray(obs, dtype=np.float32).copy())
-        return success_step, compute_progress_metrics(np.array(obs_list), success_step)
+        m = compute_progress_metrics(np.array(obs_list), success_step)
+        if preds:
+            p = np.asarray(preds)
+            m["t2s_pred_min"] = float(p.min())
+            m["t2s_pred_final"] = float(p[-1])
+            # THE false-optimism detector, live: the policy reached a state the
+            # model scores as nearly solved, and then did not solve it. This is
+            # the empty-gripper hover as a number, during training, without
+            # waiting for a video.
+            m["false_optimism"] = float(p.min()) if success_step is None else None
+        if rewards:
+            r = np.asarray(rewards)
+            m["reward_mean"] = float(r.mean())
+            m["reward_total"] = float(r.sum())
+            # share of steps paying >= 0 while the episode never succeeds: the
+            # policy being paid to do something that does not work
+            m["reward_nonneg_frac"] = (float(np.mean(r >= 0))
+                                       if success_step is None else None)
+            # no gradient on these steps
+            m["dead_step_frac"] = float(np.mean(np.abs(r) < 1e-3))
+        return success_step, m
 
     def _on_step(self) -> bool:
         # Use num_timesteps (total ENVIRONMENT steps across all parallel envs),
@@ -122,7 +151,11 @@ class SuccessRateCallback(BaseCallback):
             for key in ("mean_min_hand_peg_distance", "best_min_hand_peg_distance",
                         "mean_min_peg_goal_distance", "best_min_peg_goal_distance",
                         "mean_final_peg_goal_distance", "peg_moved_rate",
-                        "control_rate", "mean_obs_movement"):
+                        "control_rate", "mean_obs_movement",
+                        # the reward's own behaviour during training
+                        "mean_t2s_pred_min", "mean_false_optimism",
+                        "mean_reward_mean", "mean_reward_nonneg_frac",
+                        "mean_dead_step_frac"):
                 if progress.get(key) is not None:
                     self.logger.record(f"eval/{key}", progress[key])
 

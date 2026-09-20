@@ -71,10 +71,15 @@ from scipy.stats import pearsonr, spearmanr
 from config import CENSOR_LABEL, SUCCESS_KEY, steps_remaining_curve
 
 CONFIRM_BUFFER = 20          # frames recorded after success
+WINDOW = 10                  # sliding window for the sustained-dead-signal metrics
 HIGHER_IS_BETTER = ("pooled_spearman", "monotonicity_rho")
 CORRELATIONS = ("pooled_pearson", "pooled_spearman", "monotonicity_rho")
 REPORT_METRICS = ("mae", "bias", "calibration_slope", "step_slope_error",
-                  "pooled_spearman", "monotonicity_rho", "max_wrong_direction")
+                  "worst_window_slope_error", "dead_window_fraction",
+                  "max_wrong_direction")
+# the two correlation columns are omitted by default: on the observed runs they
+# read ~1.00 for every model (see the module docstring) and separated nothing.
+# Pass metrics=REPORT_METRICS + CORRELATIONS to bring them back.
 
 
 # ---- held-out bookkeeping ----------------------------------------------
@@ -132,7 +137,7 @@ def _mean(values, metric):
     return fisher_mean(vals) if metric in CORRELATIONS else float(np.mean(vals))
 
 
-def compute_metrics(preds, truths, success_step=None):
+def compute_metrics(preds, truths, success_step=None, window=WINDOW):
     """
     Per-rollout metrics. `success_step` (index of the first successful state)
     splits the curve: error metrics use the PRE-SUCCESS portion, since the
@@ -150,7 +155,8 @@ def compute_metrics(preds, truths, success_step=None):
     if not len(p):
         out.update({k: None for k in ("mae", "rmse", "bias", "calibration_slope",
                                       "monotonicity_rho", "step_slope_error",
-                                      "max_wrong_direction")})
+                                      "max_wrong_direction", "worst_window_slope_error",
+                                      "dead_window_fraction", "worst_window_start")})
         return out
 
     err = p - t
@@ -163,12 +169,51 @@ def compute_metrics(preds, truths, success_step=None):
     out["monotonicity_rho"] = _corr(spearmanr, p, -np.arange(len(p), dtype=float))
     if len(p) >= 2:
         d = -np.diff(p)                                     # predicted decrement
-        out["step_slope_error"] = float(np.mean(np.abs(d - 1.0)))
+        err = np.abs(d - 1.0)
+        out["step_slope_error"] = float(np.mean(err))
         out["max_wrong_direction"] = float(max(np.max(-d), 0.0))
+        out.update(window_metrics(err, window=window))
     else:
         out["step_slope_error"] = None
         out["max_wrong_direction"] = 0.0
+        out.update(worst_window_slope_error=None, dead_window_fraction=None,
+                   worst_window_start=None)
     return out
+
+
+def window_metrics(step_err, window=WINDOW, dead=1.0 - 1e-9):
+    """
+    Sliding-window view of the per-step slope error.
+
+    The episode MEAN hides where the signal dies, and max_wrong_direction is a
+    single frame, so there was nothing in between. Measured on a model that is
+    perfect for 45 steps and then flat for 28:
+
+        step_slope_error (mean)  0.38   <- looks BETTER than a noisy model's 1.20
+        worst 10-step window     1.00   <- exactly the dead-signal line
+
+    A mean can be dragged down by a long good stretch; a window cannot. 1.0 is
+    the threshold because a perfectly flat prediction gives |0 - 1| = 1.0
+    exactly, so a window at or above it carries no usable per-step gradient.
+
+      worst_window_slope_error  the worst sustained stretch
+      dead_window_fraction      share of windows at or above the dead line
+      worst_window_start        where it is, as a fraction through the
+                                pre-success span. Near 1.0 means the signal
+                                dies in the APPROACH to success, which is the
+                                worst place for it: that is where the shaped
+                                reward most needs to discriminate.
+    """
+    step_err = np.asarray(step_err, float)
+    if len(step_err) < window:
+        window = max(1, len(step_err))
+    if not len(step_err):
+        return dict(worst_window_slope_error=None, dead_window_fraction=None,
+                    worst_window_start=None)
+    w = np.convolve(step_err, np.ones(window) / window, mode="valid")
+    return dict(worst_window_slope_error=float(w.max()),
+                dead_window_fraction=float(np.mean(w >= dead)),
+                worst_window_start=float(np.argmax(w) / max(len(w) - 1, 1)))
 
 
 def max_wrong_direction(pred_curve, success_step=None):
@@ -287,7 +332,9 @@ def run_full_evaluation(predict_fn, success_policy, failure_policy, n_seeds=8,
     rows = report["success_scenario"]
     if rows:
         keys = ("mae", "rmse", "mae_with_tail", "bias", "calibration_slope",
-                "monotonicity_rho", "step_slope_error", "max_wrong_direction", "pred_max")
+                "monotonicity_rho", "step_slope_error", "worst_window_slope_error",
+                "dead_window_fraction", "worst_window_start",
+                "max_wrong_direction", "pred_max")
         report["summary"] = {k: _mean([r.get(k) for r in rows], k) for k in keys}
         report["summary"].update({k: report["pooled_ranking"][k]
                                   for k in ("pooled_pearson", "pooled_spearman")})
@@ -384,7 +431,9 @@ bias              : signed; NEGATIVE = claims success is nearer than it is
 calibration_slope : 1.0 is correct; no correlation can see a wrong scale
 step_slope_error  : mean |predicted decrement - 1|; what the shaped reward consumes
 pooled_spearman   : ACROSS trajectories — sees level drift between rollouts
-monotonicity_rho  : WITHIN trajectory vs frame index; ~0.99 for any decreasing curve"""
+monotonicity_rho  : WITHIN trajectory vs frame index; ~0.99 for any decreasing curve
+worst_window_slope: worst 10-step stretch; >=1.0 means a SUSTAINED dead region
+dead_window_frac  : share of windows with no usable gradient (want 0.00)"""
 
 
 def format_report_table(reports, metrics=REPORT_METRICS, sort_by="mae", show_std=True):
@@ -414,12 +463,23 @@ def format_report_table(reports, metrics=REPORT_METRICS, sort_by="mae", show_std
     return "\n".join(lines) + "\n" + LEGEND
 
 
-def plot_combo_comparison(reports, metrics=REPORT_METRICS, save_path=None, sort_by="mae"):
+def plot_combo_comparison(reports, metrics=REPORT_METRICS, save_path=None,
+                          sort_by="mae", ncols=None):
     """
-    One subplot per metric. Every seed is drawn as a dot as well as an error
-    bar, because error bars alone are invisible when the spread is small
-    relative to the bar height — a bar with +/-0.02 must not look like one
-    with +/-2.0.
+    Grid of metric panels, two rows by default, with the value printed on every
+    bar. Seven metrics in one row made each panel ~180px wide, which is not
+    enough to read a label or tell two similar bars apart.
+
+    Every seed is also drawn as a dot, because error bars alone are invisible
+    when the spread is small relative to the bar height — a bar with +/-0.02
+    must not look like one with +/-2.0.
+
+    The count under each bar is how many seeds actually contributed. It is
+    printed because _corr returns None for a CONSTANT prediction and _mean
+    drops those, so a model that flatlines on 5 of 8 seeds silently reports a
+    correlation of 1.00 computed from the other 3. n<8 on a correlation panel
+    means the model was degenerate on the missing seeds, which is worse than
+    a low score, not better.
     """
     import matplotlib.pyplot as plt
 
@@ -429,20 +489,24 @@ def plot_combo_comparison(reports, metrics=REPORT_METRICS, save_path=None, sort_
     if not cols:
         raise ValueError("none of the requested metrics are present")
 
-    fig, axes = plt.subplots(1, len(cols), figsize=(4.6 * len(cols), 4.2))
-    axes = np.atleast_1d(axes)
+    nrows = 1 if len(cols) <= 2 else 2
+    ncols = ncols or int(np.ceil(len(cols) / nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.4 * ncols, 4.6 * nrows))
+    axes = np.atleast_1d(axes).ravel()
 
     for ax, metric in zip(axes, cols):
         stats = [metric_mean_std(reports[c], metric) for c in names]
         values = [np.nan if m is None else m for m, _ in stats]
         errs = [sd or 0.0 for _, sd in stats]
-        bars = ax.bar(range(len(names)), values, yerr=errs, capsize=4, color="tab:blue")
+        bars = ax.bar(range(len(names)), values, yerr=errs, capsize=3, color="tab:blue",
+                      error_kw=dict(ecolor="0.3", lw=1))
 
+        per_seed = {c: [r[metric] for r in reports[c].get("success_scenario", [])
+                        if r.get(metric) is not None] for c in names}
         for xi, c in enumerate(names):
-            pts = [r[metric] for r in reports[c].get("success_scenario", [])
-                   if r.get(metric) is not None]
-            if pts:
-                ax.scatter([xi] * len(pts), pts, s=14, color="black", zorder=3, alpha=.75)
+            if per_seed[c]:
+                ax.scatter([xi] * len(per_seed[c]), per_seed[c], s=12, color="black",
+                           zorder=3, alpha=.7)
 
         finite = [v for v in values if not np.isnan(v)]
         if finite:
@@ -454,14 +518,44 @@ def plot_combo_comparison(reports, metrics=REPORT_METRICS, save_path=None, sort_
                 for bar, v in zip(bars, values):
                     if v == best:
                         bar.set_color("tab:green")
+
+        # ---- the value on every bar ----
+        span = (max([v for v in values if not np.isnan(v)] + [0])
+                - min([v for v in values if not np.isnan(v)] + [0])) or 1.0
+        pad = 0.04 * span
+        for xi, (v, e) in enumerate(zip(values, errs)):
+            if np.isnan(v):
+                continue
+            top = max([v + e] + per_seed[names[xi]])
+            bot = min([v - e] + per_seed[names[xi]])
+            y, va = ((top + pad, "bottom") if v >= 0 else (bot - pad, "top"))
+            ax.text(xi, y, f"{v:.2f}", ha="center", va=va, fontsize=7.5)
+            n_seeds = len(per_seed[names[xi]])
+            if metric in CORRELATIONS and n_seeds:
+                ax.text(xi, bot - pad, f"n={n_seeds}", ha="center", va="top",
+                        fontsize=6.5, color="0.45")
+
         if metric == "calibration_slope":
-            ax.axhline(1.0, color="tab:red", ls="--", lw=1)
-        ax.set_title(metric, fontsize=9)
+            ax.axhline(1.0, color="tab:red", ls="--", lw=1, label="correct = 1.0")
+            ax.legend(fontsize=7)
+        if metric in ("step_slope_error", "worst_window_slope_error"):
+            # a perfectly FLAT prediction gives |0 - 1| = 1.0 exactly, so this
+            # line is the dead-signal threshold: at or above it the prediction
+            # carries no usable per-step gradient
+            ax.axhline(1.0, color="tab:red", ls="--", lw=1, label="flat = 1.0 (dead)")
+            ax.legend(fontsize=7)
+        ax.set_title(metric, fontsize=10)
         ax.set_xticks(range(len(names)))
-        ax.set_xticklabels(names, rotation=45, ha="right", fontsize=8)
+        ax.set_xticklabels(names, rotation=45, ha="right", fontsize=7.5)
+        ax.margins(y=0.18)
         ax.grid(axis="y", alpha=.3)
 
-    plt.tight_layout()
+    for ax in axes[len(cols):]:
+        ax.axis("off")
+
+    fig.suptitle("T2S model comparison on held-out SUCCESS rollouts "
+                 "(failure rollouts contribute no correlation)", fontsize=11)
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()

@@ -87,6 +87,20 @@ from progress import peg_goal_distance_curve
 DEAD_STEP_EPS = 1e-3
 
 
+def _flat_fraction(rewards, eps=DEAD_STEP_EPS, window=10):
+    """
+    Share of the trajectory where the reward is effectively CONSTANT, at any
+    level. Measured as the local standard deviation over a sliding window: a
+    reward that never varies cannot tell one action from another, whether it
+    sits at 0 or at -0.917.
+    """
+    r = np.asarray(rewards, dtype=np.float64)
+    if len(r) < window:
+        return float(np.std(r) < eps) if len(r) else None
+    win = np.lib.stride_tricks.sliding_window_view(r, window)
+    return float(np.mean(win.std(axis=-1) < eps))
+
+
 def _as_list(trajs):
     """collect_eval_trajectories now returns lists; tolerate a bare dict."""
     if trajs is None:
@@ -155,6 +169,13 @@ def analyze_reward_signal(preds, obs_seq=None, reward_mode="difference_timed",
         reward_min=float(rewards.min()),
         reward_max=float(rewards.max()),
         dead_step_fraction=float(np.mean(np.abs(rewards) < eps)),
+        # dead_step_fraction only catches rewards near ZERO, and that is the
+        # wrong test. A reward pinned at -0.917 every step is exactly as
+        # gradient-free as one pinned at 0: what a policy can learn from is
+        # whether the reward DISTINGUISHES actions, i.e. whether it varies.
+        # The failure column read 0.00 "dead" while the video showed a flat
+        # line, because the flat line was at -0.917 rather than 0.
+        flat_step_fraction=_flat_fraction(rewards, eps),
         **base,
     )
 
@@ -264,6 +285,8 @@ def format_preview_table(preview):
             hover=entry.get("hover_reward"), pred_max=entry.get("pred_max"),
             succ_dead=_agg(succ, "dead_step_fraction"),
             fail_dead=_agg(fail, "dead_step_fraction"),
+            succ_flat=_agg(succ, "flat_step_fraction"),
+            fail_flat=_agg(fail, "flat_step_fraction"),
             align=_agg(succ, "progress_alignment"),
         ))
     rows.sort(key=lambda r: r["return_gap"] if r["return_gap"] is not None else -float("inf"),
@@ -273,15 +296,17 @@ def format_preview_table(preview):
         return f"{v:.{prec}f}" if v is not None else "--"
 
     header = (f"{'combo':<20}{'mode':<18}{'return gap (mean±std)':>24}{'gap>0':>7}"
-              f"{'hover r':>9}{'predmax':>9}{'dead% s/f':>13}{'align':>7}")
+              f"{'hover r':>9}{'predmax':>9}{'dead% s/f':>13}{'flat% s/f':>13}"
+              f"{'align':>7}")
     lines = [header, "-" * len(header)]
     for r in rows:
         gap = (f"{r['return_gap']:.0f} ±{r['gap_std']:.0f}"
                if r["return_gap"] is not None else "--")
         dead = f"{fmt(r['succ_dead'], 2)}/{fmt(r['fail_dead'], 2)}"
+        flat = f"{fmt(r['succ_flat'], 2)}/{fmt(r['fail_flat'], 2)}"
         lines.append(
             f"{r['combo']:<20}{r['mode']:<18}{gap:>24}{fmt(r['gap_pos'], 2):>7}"
-            f"{fmt(r['hover'], 2):>9}{fmt(r['pred_max'], 0):>9}{dead:>13}"
+            f"{fmt(r['hover'], 2):>9}{fmt(r['pred_max'], 0):>9}{dead:>13}{flat:>13}"
             f"{fmt(r['align'], 2):>7}"
         )
     lines += [
@@ -289,18 +314,36 @@ def format_preview_table(preview):
         "return gap : success return - failure return, mean ± std over all pairs (want LARGE POSITIVE)",
         "gap>0      : fraction of success/failure pairs with a positive gap (want 1.00)",
         "hover r    : reward for standing still at predmax — MUST BE NEGATIVE or freezing pays",
-        "dead% s/f  : fraction of ~zero-reward steps (want LOW, especially on failure)",
+        "dead% s/f  : fraction of ~ZERO-reward steps (want LOW)",
+        "flat% s/f  : fraction of steps where the reward is CONSTANT at any level.",
+        "             This is the real dead-signal measure — a reward pinned at",
+        "             -0.92 distinguishes actions no better than one pinned at 0.",
         "align      : Spearman(reward, peg-distance reduction) (want POSITIVE)",
     ]
     return "\n".join(lines)
 
 
-def check_preview(preview, reward_mode):
+def check_preview(preview, reward_mode, guard_pred_max=None):
     """
     Turn the preview into a pass/fail verdict per combo for one reward mode.
-    Returns {combo: dict(ok=bool, reasons=[...])}. Call this before a sweep
-    instead of eyeballing the table.
+    Returns {combo: dict(ok=bool, reasons=[...])}.
+
+    guard_pred_max: the prediction level the HOVERING check is evaluated at.
+        Defaults to config.T2S_PRED_CLIP_MAX, i.e. worst case.
+
+        It used to default to the maximum observed on the reference
+        trajectories, which are rollouts of the held-out EXPERT. An untrained
+        policy does not visit those states — t2s_probe showed the same model
+        reaching 218 under a modest hand displacement while its trajectory
+        maximum was under 100. Since hover pays (1-gamma)*pred - time_penalty,
+        checking at the expert's range lets gamma=0.99 pass for a model that
+        will be paid +1.18/step to freeze the moment the policy wanders.
+        A guard that only inspects the easy states is not a guard.
     """
+    from config import T2S_PRED_CLIP_MAX
+    from reward_fn import hover_reward, SHAPED_MODES
+
+    guard = T2S_PRED_CLIP_MAX if guard_pred_max is None else guard_pred_max
     verdicts = {}
     for (combo, mode), entry in preview.items():
         if mode != reward_mode:
@@ -315,17 +358,27 @@ def check_preview(preview, reward_mode):
             reasons.append(
                 f"return_gap sign flips on {(1 - entry['gap_positive_fraction']):.0%} of pairs "
                 f"(mean {gap:.0f} ± {entry.get('return_gap_std', 0):.0f})")
-        hov = entry.get("hover_reward")
-        if hov is not None and hov >= 0:
+        observed = entry.get("pred_max")
+        hov = entry.get("hover_reward")          # at the OBSERVED maximum
+        hov_guard = (float(hover_reward(guard, reward_mode=reward_mode,
+                                        gamma=entry.get("gamma", 1.0)))
+                     if reward_mode in SHAPED_MODES else None)
+        if hov_guard is not None and hov_guard >= 0:
             reasons.append(
-                f"hover_reward {hov:+.2f} >= 0 at pred_max {entry.get('pred_max', 0):.0f}: "
-                f"standing still is profitable at gamma={entry.get('gamma')}")
-        fail_dead = _agg(entry["per_scenario"].get("failure", []), "dead_step_fraction")
-        if fail_dead is not None and fail_dead > 0.8:
-            reasons.append(f"{fail_dead:.0%} of failure-trajectory steps give no gradient")
-        verdicts[combo] = dict(ok=not reasons, reasons=reasons,
-                               return_gap=gap, hover_reward=hov,
-                               pred_max=entry.get("pred_max"))
+                f"hover_reward {hov_guard:+.2f} >= 0 at the reachable ceiling "
+                f"{guard:.0f} (observed max on the reference rollouts was only "
+                f"{observed:.0f}): standing still becomes profitable at "
+                f"gamma={entry.get('gamma')} as soon as the policy leaves the "
+                "expert's region")
+        fail_flat = _agg(entry["per_scenario"].get("failure", []), "flat_step_fraction")
+        if fail_flat is not None and fail_flat > 0.8:
+            reasons.append(
+                f"{fail_flat:.0%} of failure-trajectory steps have a CONSTANT reward "
+                "(at any level) — no gradient, so the policy there is decided by "
+                "entropy and critic noise rather than by the reward")
+        verdicts[combo] = dict(ok=not reasons, reasons=reasons, return_gap=gap,
+                               hover_reward=hov, hover_reward_guard=hov_guard,
+                               pred_max=observed, guard_pred_max=guard)
     return verdicts
 
 

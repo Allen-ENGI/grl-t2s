@@ -7,7 +7,9 @@ Standalone video generation — separate from the graphs on purpose.
     python make_videos.py --models td0boot_all mc_succ --policy-run sweep_v6_td0boot_all_seed0
 
 run_3_eval.py produces the numbers and the bar charts. This produces the
-footage.
+footage. They were one script, which meant re-rendering video to try a
+different reward mode also re-ran the whole evaluation, and choosing which
+models to film meant editing an evaluation script.
 
 WHAT THE OVERLAY SHOWS
 ----------------------
@@ -50,10 +52,10 @@ import sys
 # None means "every combo in the run".
 # e.g. MODELS = ["tdlambdaboot_succ", "td0_all", "mc_all"]
 # ---------------------------------------------------------------------------
-MODELS = ["tdlambdaboot_succ", "td0boot_succ"]
+MODELS = None
 
 T2S_RUN = "v3"                      # t2s_model run name (run_2_train.py --run-name)
-REWARD_MODE = "difference"    # absolute | difference | difference_timed
+REWARD_MODE = "difference_timed"    # absolute | difference | difference_timed
 SEEDS = (500,)                      # rollout seeds; one video per model per seed
 FPS = None                          # None -> t2s_video.FPS (12)
 # ---------------------------------------------------------------------------
@@ -79,6 +81,13 @@ def parse_args(argv=None):
     p.add_argument("--policy-run", default=None,
                    help="film a TRAINED policy from this policy run instead of the "
                         "expert checkpoints, e.g. sweep_v6_td0boot_all_seed0")
+    p.add_argument("--checkpoint", default="policy_final.zip",
+                   help="which checkpoint inside --policy-run to load. Bare "
+                        "filename or absolute path. Checkpoints are written every "
+                        "ckpt_freq steps as policy_<steps>.zip, so e.g. "
+                        "policy_200000.zip films the policy mid-training — useful "
+                        "when the final one regressed, which progress.py's own "
+                        "docstring notes has happened in this project.")
     p.add_argument("--out", default=None, help="output dir (default: the eval run's videos/)")
     p.add_argument("--no-comparison", dest="comparison", action="store_false", default=True,
                    help="skip the all-models-on-one-rollout video")
@@ -146,7 +155,7 @@ def main(argv=None):
         except KeyError:
             raise SystemExit(f"ERROR: no policy run named {args.policy_run!r}. "
                              f"Registered: {results.list_runs('policy')}")
-        policy, path = visualize.load_policy("policy_final.zip", pol_dir)
+        policy, path = visualize.load_policy(args.checkpoint, pol_dir)
         print(f"    filming TRAINED policy {path}")
         scenarios = {"policy": policy}
     else:

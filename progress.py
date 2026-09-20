@@ -35,8 +35,13 @@ Metrics:
     value. Cheap, unambiguous check — if False, the object was never
     touched regardless of what any distance metric suggests.
   - achieved_control: whether the object ever came under the effector's
-    control, reusing data_collection.detect_control_onset. A meaningful
-    milestone on the way to insertion.
+    control, reusing data_collection.detect_control_onset. CAUTION: this fires
+    on PUSHING as well as grasping — a hand shoving the peg across the table
+    moves with it at a constant offset, which is exactly the signature it
+    tests. Read it with peg_lifted, never alone.
+  - peg_lift_max / peg_lifted: how far the peg rose above its reset height.
+    The one metric that separates a grasp from a shove, because pushing along
+    the table leaves height unchanged.
   - obs_movement: total observation change over the episode. Near-zero
     means the arm became static — which matters for interpreting flat T2S
     predictions (a constant prediction on a constant observation is
@@ -48,7 +53,21 @@ import numpy as np
 
 from config import HAND_POS_IDX, PEG_POS_IDX, GOAL_POS_IDX
 
-PEG_MOVED_EPS = 1e-6   # peg position change below this counts as "never touched"
+# Threshold for "the peg was displaced". 1e-6 was far too low: a random-action
+# rollout measured a peg-z range of 0.0074, which is 7,400x that — so
+# peg_moved_rate read 1.00 for every policy including a random one, and the
+# column was saturated rather than informative. 1cm is about the scale of a
+# deliberate nudge and well above settling jitter.
+PEG_MOVED_EPS = 0.01
+PEG_JITTER_EPS = 1e-6  # the old value, kept to report "touched at all"
+
+# A grasp LIFTS the peg. Pushing it along the table does not. Both satisfy
+# detect_control_onset (hand and peg move together with a constant offset) and
+# both reduce peg-to-goal distance, so neither of those metrics can tell them
+# apart — a run reporting control_rate 1.00 and 74% of the way to the hole can
+# still be a policy shoving the peg across the table. Height is the one signal
+# that separates them.
+PEG_LIFT_EPS = 0.01    # metres above the reset height that counts as lifted
 
 
 def hand_peg_distance(obs):
@@ -105,6 +124,8 @@ def compute_progress_metrics(obs_seq, success_step=None, include_control_onset=T
     hand_dist = hand_peg_distance_curve(obs_seq)
     peg_positions = np.asarray(obs_seq, dtype=np.float64)[:, PEG_POS_IDX]
     peg_drift = float(np.abs(peg_positions - peg_positions[0]).max())
+    # PEG_POS_IDX is [x, y, z]; the third component is height
+    peg_lift = float((peg_positions[:, 2] - peg_positions[0, 2]).max())
 
     out = dict(
         n_steps=int(len(obs_seq)),
@@ -117,6 +138,10 @@ def compute_progress_metrics(obs_seq, success_step=None, include_control_onset=T
         mean_peg_goal_distance=float(dist.mean()),
         # was the object touched at all?
         peg_moved=bool(peg_drift > PEG_MOVED_EPS),
+        peg_jittered=bool(peg_drift > PEG_JITTER_EPS),
+        # vertical displacement only: the discriminator between a grasp and a shove
+        peg_lift_max=peg_lift,
+        peg_lifted=bool(peg_lift > PEG_LIFT_EPS),
         peg_max_drift=peg_drift,
         obs_movement=obs_movement(obs_seq),
         succeeded=success_step is not None,
@@ -303,7 +328,14 @@ def aggregate_progress_metrics(metric_dicts):
     numeric_keys = ("min_hand_peg_distance", "final_hand_peg_distance",
                      "min_peg_goal_distance", "final_peg_goal_distance",
                      "mean_peg_goal_distance", "peg_max_drift",
-                     "obs_movement", "n_steps")
+                     "obs_movement", "n_steps",
+                     # reward-side keys the RL eval now records; averaged the
+                     # same way, and skipped when absent (they only exist when
+                     # the eval env is the T2S-wrapped one)
+                     "peg_lift_max",
+                     "t2s_pred_min", "t2s_pred_final", "false_optimism",
+                     "reward_mean", "reward_total", "reward_nonneg_frac",
+                     "dead_step_frac")
     out = {}
     for k in numeric_keys:
         vals = [m[k] for m in metric_dicts if m.get(k) is not None]
@@ -312,6 +344,9 @@ def aggregate_progress_metrics(metric_dicts):
     # fraction of episodes in which the object was touched at all — the
     # clearest single indicator of whether the reach phase is working
     out["peg_moved_rate"] = float(np.mean([bool(m.get("peg_moved")) for m in metric_dicts]))
+    out["peg_jitter_rate"] = float(np.mean([bool(m.get("peg_jittered")) for m in metric_dicts]))
+    # the honest "did it pick the peg up" rate
+    out["peg_lifted_rate"] = float(np.mean([bool(m.get("peg_lifted")) for m in metric_dicts]))
     control = [m["achieved_control"] for m in metric_dicts if m.get("achieved_control") is not None]
     out["control_rate"] = float(np.mean(control)) if control else None
     # best (closest) single episode, not just the average — shows whether ANY

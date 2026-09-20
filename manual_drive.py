@@ -71,7 +71,7 @@ MOVES = {
     "still":   (0.0,  0.0, 0.0, 0.0),
 }
 PRESETS = {
-    "retreat": "back:50,up:20, right:10",
+    "retreat": "back:30,up:10",
     "wander":  "left:15,back:15,right:15,up:10",
     "lift":    "up:25",
     "nudge":   "back:10",
@@ -111,10 +111,25 @@ def parse_args(argv=None):
     p.add_argument("--t2s-run", default="v3", help="t2s_model run name")
     p.add_argument("--models", nargs="+", default=None,
                    help="combo names to score (default: all in the run)")
+    p.add_argument("--takeover", default="success", choices=["success", "failure"],
+                   help="which held-out expert takes over after the drive. "
+                        "'success' answers 'can a competent policy recover, and "
+                        "did the model predict how long it would take'. 'failure' "
+                        "answers 'what does the model predict while a policy "
+                        "flounders somewhere it has never been' — the regime where "
+                        "a shaped reward actually operates, and the one no "
+                        "success-rollout metric can see.")
     p.add_argument("--policy-run", default=None,
                    help="take over with a TRAINED policy from this policy run "
-                        "(default: the held-out success expert)")
-    p.add_argument("--reward-mode", default="difference",
+                        "instead of an expert; overrides --takeover")
+    p.add_argument("--checkpoint", default="policy_final.zip",
+                   help="which checkpoint inside --policy-run to load. Bare "
+                        "filename or absolute path. Checkpoints are written every "
+                        "ckpt_freq steps as policy_<steps>.zip, so e.g. "
+                        "policy_200000.zip films the policy mid-training — useful "
+                        "when the final one regressed, which progress.py's own "
+                        "docstring notes has happened in this project.")
+    p.add_argument("--reward-mode", default="difference_timed",
                    choices=["absolute", "difference", "difference_timed"])
     p.add_argument("--gamma", type=float, default=None)
     p.add_argument("--seed", type=int, default=0)
@@ -230,6 +245,9 @@ def render_phased(roll, predict_fn, save_path, combo, reward_mode, gamma, fps):
         # did the prediction RISE while the arm was driven away? It should.
         rose_during_drive=bool(preds[min(ho, n - 1)] > preds[0]),
         actual_steps_after_handover=(int(ss - ho) if ss is not None else None),
+        # lowest prediction once the takeover policy is driving: on a rollout
+        # that never succeeds this is the model's most confident false claim
+        pred_min_after_handover=float(preds[min(ho, n - 1):n].min()),
         succeeded=ss is not None,
         total_return=float(np.sum(rewards)),
     )
@@ -264,12 +282,16 @@ def main(argv=None):
     if args.policy_run:
         import visualize
         pol_dir = results.get_run_dir("policy", args.policy_run)
-        policy, path = visualize.load_policy("policy_final.zip", pol_dir)
+        policy, path = visualize.load_policy(args.checkpoint, pol_dir)
         print(f"    takeover: trained policy {os.path.basename(path)}")
+        takeover_name = os.path.basename(path)
     else:
-        path = os.path.join(config.EXPERT_POLICY_DIR, stage3["success_ckpt"])
+        # the manifest key is "failure_ckpt", not "failed_ckpt"
+        key = "success_ckpt" if args.takeover == "success" else "failure_ckpt"
+        takeover_name = stage3[key]
+        path = os.path.join(config.EXPERT_POLICY_DIR, takeover_name)
         policy = SAC.load(path)
-        print(f"    takeover: held-out expert {stage3['success_ckpt']}")
+        print(f"    takeover: held-out {args.takeover} expert {takeover_name}")
 
     # ---- roll ONCE; every model scores the same frames -------------------
     roll = drive_then_policy(policy, drive, seed=args.seed, max_steps=args.max_steps)
@@ -280,7 +302,11 @@ def main(argv=None):
     print(f"    hand->peg  {hand_peg_distance(o0):.4f} -> {hand_peg_distance(oh):.4f}")
     print(f"    peg->goal  {peg_goal_distance(o0):.4f} -> {peg_goal_distance(oh):.4f}")
     if roll["success_step"] is None:
-        print(f"    policy did NOT recover: no success in {len(roll['obs'])} steps")
+        print(f"    no success in {len(roll['obs'])} steps"
+              + ("  (expected — the failure expert rarely succeeds; the point is "
+                 "what the MODEL predicts while it flounders)"
+                 if args.takeover == "failure" and not args.policy_run
+                 else "  — the policy did NOT recover"))
     else:
         print(f"    policy recovered: success at step {roll['success_step']} "
               f"({roll['success_step'] - ho} steps after handover)")
@@ -317,6 +343,30 @@ def main(argv=None):
 
     # ---- the table this script exists for --------------------------------
     actual = rows[combos[0]]["actual_steps_after_handover"]
+    if actual is None:
+        # no ground truth exists, so score what CAN be scored without it: did
+        # the prediction rise as the arm was driven away, and how low did it
+        # fall while the takeover policy failed to solve anything. A low
+        # minimum here is the model's most confident false claim.
+        print(f"\n{'combo':<24}{'pred@start':>11}{'pred@handover':>15}{'rose?':>7}"
+              f"{'min pred':>10}{'verdict':>26}")
+        print("-" * 93)
+        for c in sorted(combos,
+                        key=lambda c: -(rows[c].get("pred_min_after_handover") or 0)):
+            r = rows[c]
+            lo = r.get("pred_min_after_handover")
+            v = ("falsely optimistic" if lo is not None and lo < 30 else "stays pessimistic")
+            print(f"{c:<24}{r['pred_at_start']:>11.1f}{r['pred_at_handover']:>15.1f}"
+                  f"{('yes' if r['rose_during_drive'] else 'NO'):>7}"
+                  f"{(f'{lo:.1f}' if lo is not None else '--'):>10}{v:>26}")
+        print("\nno success occurred, so there is no 'actual steps left' to compare")
+        print("against. LOW min pred on a trajectory that never succeeds is the")
+        print("failure this whole project is about.")
+        with open(os.path.join(out_dir, f"drive_{tag}_index.json"), "w") as f:
+            json.dump(dict(drive=args.drive, handover=ho, seed=args.seed,
+                           takeover=args.takeover, reward_mode=args.reward_mode,
+                           gamma=gamma, success_step=None, models=rows), f, indent=2)
+        return 0
     print(f"\n{'combo':<24}{'pred@start':>11}{'pred@handover':>15}{'rose?':>7}"
           f"{'actual left':>13}{'error':>9}")
     print("-" * 79)

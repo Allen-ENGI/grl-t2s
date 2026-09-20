@@ -10,6 +10,7 @@ exactly one definition.
 """
 import os
 import pickle
+
 import gymnasium as gym
 import metaworld  # noqa: F401  (registers the Meta-World envs)
 
@@ -55,6 +56,55 @@ def make_fixed_scene_env(render_mode=None, camera_name="corner2", fixed_task_pat
     with open(fixed_task_path, "rb") as f:
         env.unwrapped.set_task(pickle.load(f))
     return env
+
+
+def check_obs_contains_history(n_steps=6, seed=0):
+    """
+    Does the observation already carry the previous timestep?
+
+    MetaWorld's 39-dim observation is documented as
+    [current(18) | previous(18) | goal(3)], which would mean indices 18..35 are
+    a one-step history and velocity is already inferable from a single
+    observation. This codebase names only 10 of the 39 indices, so that has
+    never been verified here — and it decides whether feeding the T2S model a
+    window of frames would add anything or merely duplicate what it is already
+    given.
+
+    Returns a dict with the verdict. Run it before building any frame-stacking:
+    if history is already present, the question becomes whether the model USES
+    it (see t2s_probe's `d/d other` column, which covers exactly these
+    indices), not whether to supply it.
+    """
+    import numpy as np
+
+    env = make_fixed_scene_env()
+    obs, _ = env.reset(seed=seed)
+    prev = np.asarray(obs, dtype=np.float64).copy()
+    matches, diffs = [], []
+    for _ in range(n_steps):
+        obs, _r, term, trunc, _info = env.step(env.action_space.sample())
+        cur = np.asarray(obs, dtype=np.float64)
+        # the claim: cur[18:36] == prev[0:18]
+        d = float(np.abs(cur[18:36] - prev[:18]).max())
+        diffs.append(d)
+        matches.append(d < 1e-6)
+        prev = cur.copy()
+        if term or trunc:
+            break
+    env.close()
+
+    frac = float(np.mean(matches)) if matches else 0.0
+    return dict(
+        n_steps=len(matches), fraction_matching=frac,
+        max_abs_difference=float(np.max(diffs)) if diffs else None,
+        has_history=bool(frac > 0.9),
+        verdict=("obs[18:36] IS the previous obs[0:18] — the observation is "
+                 "already a 2-frame window; check whether the model uses it "
+                 "(t2s_probe `d/d other`) before stacking more"
+                 if frac > 0.9 else
+                 "obs[18:36] is NOT the previous timestep — no history present, "
+                 "so a windowed input would add genuinely new information"),
+    )
 
 
 def assert_scene_is_fixed(fixed_task_path=FIXED_TASK_PATH):

@@ -62,7 +62,7 @@ FLIP_FRAMES = True
 # ONE place it is set; it used to be a hardcoded 20 in four separate defaults,
 # and evaluate_with_video had no way to pass it at all.
 FPS = 12
-PANEL_W = 300               # width of the readout panel, px
+PANEL_W = 340               # width of the readout panel, px
 TRACE_H = 150               # height of the scrolling trace, px
 
 
@@ -161,114 +161,169 @@ def _draw_trace(draw, preds, truth, i, box, danger=DANGER_THRESHOLD):
     if p:
         cx, cy = p[-1]
         draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), fill=(255, 255, 255))
-    draw.text((x0 + 6, y0 + 5), f"T2S trace (max {hi:.0f})", fill=(165, 165, 175),
-              font=_font(11))
+    draw.text((x0 + 8, y0 + 10), f"T2S trace   max {hi:.0f}", fill=(150, 150, 162),
+              font=_font(10))
+    # label the live value at the cursor, so the trace is readable on its own
+    if len(preds) and i < len(preds):
+        draw.text((x0 + 8, y1 - 16), f"now {float(preds[i]):,.1f}",
+                  fill=(120, 200, 245), font=_font(10))
+
+
+def _bar(d, x, y, w, h, frac, color, ticks=5, hi=None):
+    """Countdown bar with tick marks and an end label."""
+    d.rectangle((x, y, x + w, y + h), fill=(26, 26, 32), outline=(70, 70, 82))
+    if frac > 0:
+        d.rectangle((x, y, x + int(w * min(frac, 1.0)), y + h), fill=color)
+    for k in range(1, ticks):
+        tx = x + int(w * k / ticks)
+        d.line((tx, y, tx, y + h), fill=(70, 70, 82), width=1)
+    if hi is not None:
+        d.text((x + w + 4, y - 1), f"{hi:.0f}", fill=(120, 120, 132), font=_font(10))
 
 
 def compose_frame(frame, i, preds, truth=None, obs=None, rewards=None,
                   success_step=None, danger_threshold=DANGER_THRESHOLD,
                   label=None, censor_label=CENSOR_LABEL, reward_mode=None):
     """
-    One annotated frame: scene on the left, readout panel on the right, trace
-    beneath the readout. Returns an RGB uint8 array.
+    One annotated frame: scene on the left, readout on the right, trace beneath.
 
-    The canvas is sized to whichever is taller, the scene or the panel's own
-    content. Sizing it to the scene alone let the trace panel overlap the
-    readout text whenever the rendered frame was shorter than the readout
-    needed (180px scene vs ~250px of text), which hid the numbers the video
-    exists to show.
+    The prediction is the reason this video exists, so it gets the visual
+    hierarchy: a 52px figure with a "STEPS LEFT" caption, the truth and error
+    directly beneath it in a fixed-width comparison, and a draining countdown
+    bar with ticks. Everything else is secondary and drawn smaller. The first
+    version gave the prediction the same weight as the distance readouts, so
+    the number the viewer is meant to be reading did not stand out from five
+    other numbers.
+
+    Colour encodes MEANING, not just magnitude:
+      red     claims imminent success on a state that is not successful
+      amber   off the truth by more than 25%
+      green   within 25% of the truth, or genuinely successful
+      grey    no truth exists (a trajectory that never succeeds)
+
+    The canvas height is constant within a video — every optional line has a
+    reserved slot — because a changing height makes the encoder reject the
+    file outright.
     """
     from PIL import Image, ImageDraw
 
     scene = Image.fromarray(np.asarray(frame, dtype=np.uint8)).convert("RGB")
     sw, sh = scene.size
-    f_big, f_med, f_sm = _font(30), _font(15), _font(12)
+    f_huge, f_big, f_med, f_sm, f_xs = _font(52), _font(20), _font(15), _font(12), _font(10)
 
     p = float(preds[i]) if i < len(preds) else float("nan")
-    optimistic = p < danger_threshold
+    t = float(truth[i]) if (truth is not None and i < len(truth)) else None
     succeeded_yet = success_step is not None and i >= success_step
-    # red only when the model claims imminent success on a state that is NOT
-    # actually successful — that combination is the false optimism this is for
-    color = (255, 80, 80) if (optimistic and not succeeded_yet) else (235, 235, 240)
+    optimistic = p < danger_threshold
 
-    # ---- lay the readout out first, as (text, font, fill) lines ----
-    lines = []
-    if label:
-        lines.append((label[:44], f_sm, (150, 150, 160)))
-    lines.append(("T2S predicted", f_sm, (150, 150, 160)))
-    lines.append((f"{p:7.1f}", f_big, color))
-    if truth is not None and i < len(truth):
-        t = float(truth[i])
-        lines.append((f"truth   {t:7.1f}", f_med, (180, 180, 190)))
-        lines.append((f"error   {p - t:+7.1f}", f_med, (180, 180, 190)))
+    if succeeded_yet:
+        col = (120, 230, 140)
+    elif optimistic and t is None:
+        col = (255, 80, 80)                       # imminent success that never comes
+    elif t is None:
+        col = (215, 215, 225)
     else:
-        lines.append(("truth      n/a", f_med, (140, 140, 150)))
-        lines.append((f"(never succeeds, censor {censor_label:.0f})", f_sm, (140, 140, 150)))
-    # ALWAYS emit this line, even at i=0 where no transition has happened yet.
-    # Emitting it conditionally changed the line count between frames, which
-    # changed the canvas height, which made the encoder reject the video with
-    # "All images in a movie should have same size".
-    if rewards is not None:
-        tag = f" ({reward_mode})" if reward_mode else ""
-        if 0 < i <= len(rewards):
-            r = float(rewards[i - 1])
-            rc = (120, 230, 140) if r > 0 else (230, 160, 120) if r < 0 else (150, 150, 160)
-            lines.append((f"step r  {r:+7.2f}{tag}", f_med, rc))
-        else:
-            lines.append((f"step r       --{tag}", f_med, (110, 110, 120)))
-        # cumulative return to this frame. The step reward says what the last
-        # action earned; the running total is what the RL objective actually
-        # maximises, and it is the number that makes a long stretch of small
-        # negative rewards visibly worse than a short one.
-        cum = float(np.sum(rewards[:max(i, 0)]))
-        cc = (120, 230, 140) if cum > 0 else (230, 160, 120) if cum < 0 else (150, 150, 160)
-        lines.append((f"return  {cum:+8.1f}", f_med, cc))
-    if obs is not None and i < len(obs):
-        hp = hand_peg_distance_curve(obs[:i + 1])[-1]
-        pg = peg_goal_distance_curve(obs[:i + 1])[-1]
-        lines.append((f"hand->peg {hp:6.3f}", f_med, (170, 220, 170)))
-        lines.append((f"peg->goal {pg:6.3f}", f_med, (230, 190, 140)))
-    lines.append((f"step {i}", f_sm, (130, 130, 140)))
-    # two status slots, always present (blank when there is nothing to say), for
-    # the same constant-height reason as the reward line above
-    # all status slots use the SAME font, so two slots are always the same
-    # pixel height — mixing f_med and f_sm left a 4px difference between
-    # frames, which the encoder tolerated only because _pad_to_macroblock pads
-    # to the batch maximum, and which made the panel jitter on playback
-    status = ([("SUCCESS", f_sm, (120, 230, 140))] if succeeded_yet
-              else [("claims imminent success", f_sm, (255, 80, 80)),
-                    ("— but it never comes", f_sm, (255, 80, 80))] if optimistic
-              else [])
-    lines += status + [("", f_sm, (0, 0, 0))] * (2 - len(status))
+        rel = abs(p - t) / max(t, 1.0)
+        col = ((120, 230, 140) if rel <= 0.25 else
+               (235, 190, 90) if rel <= 0.75 else (255, 110, 90))
 
-    def line_h(font):
-        return 36 if font is f_big else 20 if font is f_med else 16
+    pad, gap = 12, 8
+    x = sw + pad
+    inner = PANEL_W - 2 * pad
 
-    pad_top, bar_h, gap = 10, 12, 10
-    readout_h = pad_top + sum(line_h(f) for _txt, f, _c in lines) + gap + bar_h
-    panel_h = readout_h + gap + TRACE_H + gap
+    # ---- fixed-height layout, measured top-down --------------------------
+    head_h = 16 if label else 0
+    hero_h = 14 + 54 + 14                          # caption + figure + unit line
+    cmp_h = 2 * 18                                 # truth + error (or placeholders)
+    bar_h = 26
+    bar_caption_h = 12                             # the "true" tick caption below the bar
+    sec_h = 4 * 18                                 # step r, return, hand, peg
+    status_h = 2 * 15
+    panel_h = (pad + head_h + hero_h + cmp_h + gap + bar_h + bar_caption_h + gap
+               + sec_h + status_h + gap + TRACE_H + pad)
     H = max(sh, panel_h)
 
     out = Image.new("RGB", (sw + PANEL_W, H), (12, 12, 15))
     out.paste(scene, (0, 0))
     d = ImageDraw.Draw(out)
+    y = pad
 
-    x, y = sw + 12, pad_top
-    for txt, font, fill in lines:
-        d.text((x, y), txt, fill=fill, font=font)
-        y += line_h(font)
+    if label:
+        d.text((x, y), label[:44], fill=(140, 140, 152), font=f_sm)
+        y += head_h
 
-    # countdown bar, scaled to the run's own maximum prediction
+    # ---- the hero number -------------------------------------------------
+    d.text((x, y), "PREDICTED STEPS LEFT", fill=(150, 150, 164), font=f_xs)
+    y += 14
+    txt = f"{p:,.1f}" if np.isfinite(p) else "--"
+    d.text((x, y), txt, fill=col, font=f_huge)
+    # unit tucked against the figure
+    tw = d.textlength(txt, font=f_huge)
+    d.text((x + tw + 8, y + 30), "steps", fill=(120, 120, 134), font=f_sm)
+    y += 54 + 14
+
+    # ---- truth / error, fixed two lines ----------------------------------
+    if t is not None:
+        err = p - t
+        d.text((x, y), f"{'truth':<7}{t:>8,.1f}", fill=(185, 185, 196), font=f_med)
+        y += 18
+        ec = (150, 230, 160) if abs(err) <= max(0.1 * t, 2) else (235, 165, 120)
+        d.text((x, y), f"{'error':<7}{err:>+8,.1f}", fill=ec, font=f_med)
+        y += 18
+    else:
+        d.text((x, y), f"{'truth':<7}{'n/a':>8}", fill=(120, 120, 134), font=f_med)
+        y += 18
+        d.text((x, y), f"never succeeds (censor {censor_label:.0f})",
+               fill=(120, 120, 134), font=f_xs)
+        y += 18
+
+    # ---- countdown bar ---------------------------------------------------
     y += gap
     hi = max(float(np.nanmax(preds)), 1.0)
-    frac = min(max(p, 0.0) / hi, 1.0) if np.isfinite(p) else 0.0
-    bar_w = PANEL_W - 24
-    d.rectangle((x, y, x + bar_w, y + bar_h), outline=(70, 70, 80))
-    if frac > 0:
-        d.rectangle((x, y, x + int(bar_w * frac), y + bar_h), fill=color)
+    _bar(d, x, y, inner - 26, bar_h, (max(p, 0.0) / hi) if np.isfinite(p) else 0.0,
+         col, hi=hi)
+    if t is not None:
+        # a tick where the TRUTH sits, so over/under-prediction is visible
+        tx = x + int((inner - 26) * min(max(t, 0.0) / hi, 1.0))
+        d.line((tx, y - 3, tx, y + bar_h + 3), fill=(255, 255, 255), width=2)
+        d.text((tx - 6, y + bar_h + 4), "true", fill=(200, 200, 210), font=f_xs)
+    y += bar_h + gap + 12
 
-    ty0 = H - TRACE_H - gap
-    _draw_trace(d, preds, truth, i, (x, ty0, sw + PANEL_W - 12, H - gap),
+    # ---- secondary readouts ----------------------------------------------
+    tag = f"  ({reward_mode})" if reward_mode else ""
+    if rewards is not None:
+        if 0 < i <= len(rewards):
+            r = float(rewards[i - 1])
+            rc = (120, 220, 140) if r > 0 else (225, 160, 120) if r < 0 else (140, 140, 152)
+            d.text((x, y), f"{'step r':<8}{r:>+8.2f}{tag}", fill=rc, font=f_sm)
+        else:
+            d.text((x, y), f"{'step r':<8}{'--':>8}{tag}", fill=(110, 110, 122), font=f_sm)
+        y += 18
+        cum = float(np.sum(rewards[:max(i, 0)]))
+        d.text((x, y), f"{'return':<8}{cum:>+8.1f}", fill=(170, 170, 182), font=f_sm)
+        y += 18
+    else:
+        y += 36
+    if obs is not None and i < len(obs):
+        hp = hand_peg_distance_curve(obs[:i + 1])[-1]
+        pg = peg_goal_distance_curve(obs[:i + 1])[-1]
+        d.text((x, y), f"{'hand>peg':<9}{hp:>7.3f}", fill=(160, 210, 165), font=f_sm)
+        y += 18
+        d.text((x, y), f"{'peg>goal':<9}{pg:>7.3f}", fill=(220, 185, 140), font=f_sm)
+        y += 18
+    else:
+        y += 36
+
+    # ---- status, two reserved lines --------------------------------------
+    status = ([("SUCCESS", (120, 230, 140))] if succeeded_yet
+              else [("claims imminent success", (255, 90, 90)),
+                    ("- but it never comes", (255, 90, 90))] if optimistic
+              else [(f"step {i}", (120, 120, 134))])
+    for txt_, c_ in (status + [("", (0, 0, 0))] * 2)[:2]:
+        d.text((x, y), txt_, fill=c_, font=f_sm)
+        y += 15
+
+    _draw_trace(d, preds, truth, i, (x, H - TRACE_H - pad, sw + PANEL_W - pad, H - pad),
                 danger=danger_threshold)
     return np.array(out)
 

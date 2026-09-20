@@ -60,7 +60,7 @@ N_EVAL_EPISODES = 5
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Stage 3: downstream RL",
+        description="Stage 4: downstream RL",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--eval-run", required=True,
                    help="t2s_eval run name from run_3_eval.py")
@@ -82,10 +82,12 @@ def parse_args(argv=None):
                    help="run the gate at several gammas and stop, e.g. 0.99 0.999")
     p.add_argument("--force", action="store_true",
                    help="train even if the reward gate fails")
+    p.add_argument("--no-video", dest="video", action="store_false", default=True,
+                   help="skip the post-training policy videos")
     return p.parse_args(argv)
 
 
-def _load_predictors(t2s_run_dir, combos, manifest, run_label=""):
+def _load_predictors(t2s_run_dir, combos, manifest):
     import t2s_predict
     specs, predictors = {}, {}
     for combo in combos:
@@ -151,7 +153,7 @@ def main(argv=None):
         print(f"(no --models given; took best {len(combos)} by held-out MAE: {combos})")
 
     specs, predictors = _load_predictors(t2s_run_dir, combos, stage3)
-    print(f"\n=== Stage 3: {len(specs)} model(s) x {len(seeds)} seed(s) = "
+    print(f"\n=== Stage 4: {len(specs)} model(s) x {len(seeds)} seed(s) = "
           f"{len(specs)*len(seeds)} runs @ {args.timesteps:,} steps ===")
     print(f"    reward_mode={args.reward_mode}  RL gamma={gamma}")
     for label, (_d, combo, sd) in specs.items():
@@ -173,15 +175,19 @@ def main(argv=None):
     if args.gamma_sweep is not None:
         gammas = args.gamma_sweep or [0.99, 0.995, 0.999]
         print(f"\n=== gamma sweep (no training) ===")
-        print(f"\n{'gamma':>8}{'model':<30}{'return gap':>16}{'hover':>9}  verdict")
-        print("-" * 72)
+        print(f"\n{'gamma':>8}  {'model':<28}{'return gap':>12}"
+              f"{'hover@obs':>11}{'hover@ceil':>12}   verdict")
+        print("-" * 84)
         for g in gammas:
             v, _ = run_gate(trajectories, predictors, args.reward_mode, g, verbose=False)
             for label, d in v.items():
                 gap = f"{d['return_gap']:,.0f}" if d["return_gap"] is not None else "--"
-                print(f"{g:>8}{label:<30}{gap:>16}{d['hover_reward']:>+9.2f}"
-                      f"  {'PASS' if d['ok'] else 'FAIL'}")
-        print("\nhover must be NEGATIVE, or the policy is paid to stand still.")
+                verdict = "PASS" if d["ok"] else "FAIL"
+                print(f"{g:>8}  {label:<28}{gap:>12}{d['hover_reward']:>+11.2f}"
+                      f"{(d.get('hover_reward_guard') or 0):>+12.2f}   {verdict}")
+        print("\nBOTH hover columns must be NEGATIVE. 'obs' is the expert's range;")
+        print("'ceil' is the reachable ceiling, which is what the guard uses — an")
+        print("untrained policy leaves the expert's region on step one.")
         return 0
 
     # ---- the gate --------------------------------------------------------
@@ -195,9 +201,11 @@ def main(argv=None):
     print(f"\n--- verdict for {args.reward_mode} ---")
     failed = []
     for label, v in verdicts.items():
-        print(f"  {label:<30}{'PASS' if v['ok'] else 'FAIL'}  "
-              f"gap={v['return_gap']:,.0f}  hover={v['hover_reward']:+.2f}  "
-              f"pred_max={v['pred_max']:.0f}")
+        hg = v.get("hover_reward_guard")
+        print(f"  {label:<30}{'PASS' if v['ok'] else 'FAIL'}  gap={v['return_gap']:,.0f}"
+              f"  hover@observed({v['pred_max']:.0f})={v['hover_reward']:+.2f}"
+              + (f"  hover@ceiling({v['guard_pred_max']:.0f})={hg:+.2f}"
+                 if hg is not None else ""))
         for r in v["reasons"]:
             print(f"      - {r}")
         if not v["ok"]:
@@ -235,6 +243,43 @@ def main(argv=None):
                    "raw": {f"{c}|{s}": h for (c, s), h in sweep_results.items()}},
                   f, indent=2)
 
+    # ---- video of what each trained policy actually does -----------------
+    # Stage 3 filmed the EXPERT policies to judge the T2S models. This films
+    # the POLICIES THOSE REWARDS PRODUCED, which is the question Stage 4 is
+    # actually asking: success_rate says whether it worked, the video says what
+    # it did instead. A policy that hovers empty-handed while the prediction
+    # falls toward zero is obvious in two seconds and invisible in a table.
+    videos = {}
+    if args.video:
+        import t2s_video
+        import visualize
+
+        print("\n=== policy videos ===")
+        for label, (_d, combo, _sd) in specs.items():
+            for sd in seeds:
+                run_name = f"{args.sweep_name}_{label}_seed{sd}"
+                try:
+                    run_dir = results.get_run_dir("policy", run_name)
+                    policy, _path = visualize.load_policy("policy_final.zip", run_dir)
+                except (KeyError, FileNotFoundError) as e:
+                    print(f"  {run_name}: no final checkpoint ({e.__class__.__name__})")
+                    continue
+                roll = t2s_video.rollout_with_frames(
+                    policy, predict_t2s=predictors[label], seed=0)
+                path = os.path.join(run_dir, "policy_t2s_live.mp4")
+                _f, info = t2s_video.render_t2s_video(
+                    roll, save_path=path, reward_mode=args.reward_mode, gamma=gamma,
+                    label=f"{label} seed{sd} | policy")
+                videos[run_name] = info
+                # build the status OUTSIDE the f-string: a replacement field
+                # spanning several lines is PEP 701 syntax and only parses on
+                # Python 3.12+, so it raised SyntaxError on older interpreters
+                ss = info["success_step"]
+                status = f"SUCCESS @{ss}" if ss is not None else "never succeeded"
+                flag = "  <<< FALSELY OPTIMISTIC" if info["entered_danger_band"] else ""
+                print(f"  {run_name}: {status}"
+                      f"  pred {info['pred_min']:.0f}-{info['pred_max']:.0f}{flag}")
+
     manifest = dict(
         stage="4_policy", sweep_name=args.sweep_name, sweep_dir=sweep_dir,
         eval_run=args.eval_run, t2s_run_dir=t2s_run_dir, data_run=stage3["data_run"],
@@ -242,12 +287,18 @@ def main(argv=None):
         timesteps=args.timesteps, models=combos,
         gate=({k: {kk: vv for kk, vv in v.items() if kk != "reasons"}
                for k, v in verdicts.items()}),
-        rows=sweep_rows, ok=True)
+        rows=sweep_rows, videos=videos, ok=True)
     with open(os.path.join(sweep_dir, STAGE_MANIFEST), "w") as f:
         json.dump(manifest, f, indent=2)
 
     print(f"\nwrote {os.path.join(sweep_dir, STAGE_MANIFEST)}")
-    print("inspect a policy: see the Section 8 cell in pipeline_cells.py")
+    print("\nin eval_history.json, read these together:")
+    print("  success_rate        did it solve the task")
+    print("  peg_moved_rate      0 means it never grasped -> exploration problem")
+    print("  mean_false_optimism lowest prediction on episodes that did NOT succeed;")
+    print("                      LOW is bad, it is the empty-gripper hover as a number")
+    print("  mean_reward_nonneg  share of steps paid >= 0 while failing")
+    print("  mean_dead_step_frac share of steps with no gradient at all")
     return 0
 
 
