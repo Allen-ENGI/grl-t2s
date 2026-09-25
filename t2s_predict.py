@@ -21,7 +21,7 @@ from t2s_model import T2SModel
 
 
 def load_t2s_predictor(run_dir, method, condition, seed=0, obs_dim=OBS_DIM,
-                       pred_clip_max=T2S_PRED_CLIP_MAX, device="cpu", n_stages=None):
+                       pred_clip_max=T2S_PRED_CLIP_MAX, device="cpu"):
     """
     Returns a predict_t2s(obs, clip=True) callable with the model frozen
     (requires_grad_(False)) — never trained further during policy learning.
@@ -31,32 +31,12 @@ def load_t2s_predictor(run_dir, method, condition, seed=0, obs_dim=OBS_DIM,
     ceiling is the worst case. Keep it in config so the guard and the
     predictor cannot disagree.
     """
-    # the architecture must match what was saved, or load_state_dict raises on
-    # the stage head's keys. The manifest records it; n_stages overrides.
-    if n_stages is None:
-        try:
-            from t2s_io import load_manifest
-            n_stages = int(load_manifest(run_dir).get("n_stages", 0))
-        except Exception:
-            n_stages = 0
-
     X_mean, X_std = load_normalization(run_dir)
     assert X_mean.shape[0] == obs_dim, (
         f"normalization is {X_mean.shape[0]}-dim but obs_dim is {obs_dim} — wrong run_dir?"
     )
 
-    # T2SModel gained n_stages when the auxiliary stage head was added back.
-    # Pass it only when the installed class accepts it AND a head was actually
-    # trained, so a rolled-back t2s_model.py (no stage head) still loads.
-    import inspect
-    supports = "n_stages" in inspect.signature(T2SModel.__init__).parameters
-    if n_stages and not supports:
-        raise RuntimeError(
-            f"{run_dir} was trained with a {n_stages}-class stage head, but the "
-            "installed t2s_model.py has no n_stages parameter. Either restore the "
-            "stage-head version of t2s_model.py, or use a run trained without it.")
-    kw = dict(n_stages=n_stages) if supports else {}
-    model = T2SModel(obs_dim=obs_dim, **kw).to(device)
+    model = T2SModel(obs_dim=obs_dim).to(device)
     ckpt_path = os.path.join(run_dir, checkpoint_name(method, condition, seed))
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()

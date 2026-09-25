@@ -42,7 +42,7 @@ LAMBDA = 0.9                 # TD(lambda) trace
 BATCH_SIZE = 1024            # 256 underuses the GPU
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
-CONFIRM_BUFFER = 20          # frames kept after success when trimming the tail
+CONFIRM_BUFFER = 3          # frames kept after success when trimming the tail
 CENSOR_GAMMA = 1.0           # censor scheme only; bootstrap forces < 1
 SEED = 0                     # one seed: see run_all_combos for why not a sweep
 
@@ -52,24 +52,9 @@ METHODS = ("mc", "td0", "tdlambda")
 CONDITIONS = ("succ", "all")
 CENSOR_SCHEMES = ("censor", "bootstrap")
 
-# Auxiliary stage head. N_STAGES = 0 disables it, and 0 MUST stay the default:
-# importing t2s_stages.N_STAGES here instead made every run train a stage head
-# whether or not --with-stages was passed, which also made a no-stage baseline
-# impossible to produce.
-N_STAGES = 0
-
-# STAGE_LOSS_WEIGHT is a FRACTION OF THE COUNTDOWN LOSS, not an absolute
-# coefficient. MSE is in steps-squared and cross-entropy in nats, so a fixed
-# 0.1 * CE was 0.01%-0.6% of the total loss depending on the combo — the
-# auxiliary gradient reaching the encoder was negligible and the "stage" run
-# was the no-stage run with an extra head bolted on. The CE is now scaled by
-# the current (detached) MSE, so 0.3 means "30% as large as the countdown
-# term", and the countdown loss itself is unchanged, keeping runs comparable.
-STAGE_LOSS_WEIGHT = 0.3
-
 
 def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=CONFIRM_BUFFER,
-                     censor_bootstrap=False, with_stages=False):
+                     censor_bootstrap=False):
     """
     Loads dataset.npz, trims the long flat post-success tail, reads the STORED
     train/val split, and returns everything build_targets/train_one need.
@@ -117,18 +102,6 @@ def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=CON
         X_all, y_all, episode_ids_all, frame_idxs_all, censor_label,
         censor_bootstrap=censor_bootstrap)
 
-    # stage labels: read stages.npy if present, else derive them here. They are
-    # a function of the observations, so deriving costs nothing and keeps the
-    # dataset format unchanged.
-    stages_all = None
-    if with_stages:
-        import t2s_stages
-        cached = os.path.join(os.path.dirname(dataset_path), "stages.npy")
-        if os.path.exists(cached):
-            stages_all = np.load(cached)[keep]
-        else:
-            stages_all = t2s_stages.label_dataset(X_all, y_all, episode_ids_all)
-
     tr_all = np.flatnonzero(split_all == "train")
     va_all = np.flatnonzero(split_all == "val")
     if len(va_all) == 0:
@@ -148,8 +121,7 @@ def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=CON
         return ((X - x_mean) / x_std).astype(np.float32)
 
     return dict(
-        X_all=X_all, y_all=y_all, split_all=split_all, stages_all=stages_all,
-        next_obs_n_all=normalize(next_obs_all),
+        X_all=X_all, y_all=y_all, split_all=split_all, next_obs_n_all=normalize(next_obs_all),
         Xn_all=normalize(X_all), is_terminal_all=is_terminal_all,
         terminal_value_all=terminal_value_all, is_truncated_all=is_truncated_all,
         censor_bootstrap=censor_bootstrap, episode_ids_all=episode_ids_all,
@@ -163,8 +135,7 @@ def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=CON
 
 
 def train_one(prepared, method, condition, run_dir, seed=0, gamma=CENSOR_GAMMA,
-              target_clip=None, device="cpu", censor_bootstrap=None,
-              n_stages=N_STAGES, stage_weight=STAGE_LOSS_WEIGHT):
+              target_clip=None, device="cpu", censor_bootstrap=None):
     """
     Train one (method, condition) model. Tuning lives in the constants above;
     only the things that vary per combo are arguments.
@@ -195,36 +166,7 @@ def train_one(prepared, method, condition, run_dir, seed=0, gamma=CENSOR_GAMMA,
     ckpt_method = f"{method}boot" if censor_bootstrap else method
     ckpt_path = os.path.join(run_dir, checkpoint_name(ckpt_method, condition, seed))
 
-    stages = prepared.get("stages_all")
-    use_stages = bool(n_stages) and stages is not None
-    # T2SModel gained n_stages when the auxiliary stage head was added back.
-    # Pass it only when the INSTALLED class accepts it, so a rolled-back
-    # t2s_model.py (no stage head) still trains. Asking for a stage head that
-    # the class cannot build is an error, not something to silently ignore.
-    import inspect
-    supports = "n_stages" in inspect.signature(T2SModel.__init__).parameters
-    if use_stages and not supports:
-        raise RuntimeError(
-            "--with-stages was requested but the installed t2s_model.py has no "
-            "n_stages parameter. Either restore the stage-head version of "
-            "t2s_model.py, or train without --with-stages.")
-    if not supports:
-        use_stages = False
-    kw = dict(n_stages=n_stages if use_stages else 0) if supports else {}
-    model = T2SModel(obs_dim=obs_dim, **kw).to(device)
-    stages_t = (torch.as_tensor(stages[rows_tr], dtype=torch.long, device=device)
-                if use_stages else None)
-    # Class-balanced weights. `coupled` — the grasp, the stage that matters
-    # most — is ~3% of trimmed rows, so unweighted cross-entropy lets the head
-    # fold it into `reach` or `lifted` at almost no cost and the encoder is
-    # never pushed to represent it. Inverse frequency, clipped so an
-    # essentially empty class cannot dominate.
-    stage_w = None
-    if use_stages:
-        counts = np.bincount(stages[rows_tr], minlength=n_stages).astype(np.float64)
-        w = counts.sum() / np.maximum(counts, 1.0) / n_stages
-        w = np.clip(w, 0.1, 10.0)
-        stage_w = torch.as_tensor(w, dtype=torch.float32, device=device)
+    model = T2SModel(obs_dim=obs_dim).to(device)
     target_net = copy.deepcopy(model)
     opt = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
@@ -278,16 +220,7 @@ def train_one(prepared, method, condition, run_dir, seed=0, gamma=CENSOR_GAMMA,
         for s in range(0, len(perm), batch_size):
             b = perm[s:s + batch_size]
             opt.zero_grad()
-            if use_stages:
-                pred, logits = model.forward_both(Xn_tr_t[b])
-                mse = F.mse_loss(pred, yb_tr_t[b])
-                ce = F.cross_entropy(logits, stages_t[b], weight=stage_w)
-                # scale CE by the detached MSE so the weight is RELATIVE: the
-                # countdown gradient is exactly what it was without stages, and
-                # the auxiliary term is stage_weight times its magnitude
-                loss = mse + stage_weight * mse.detach() * ce
-            else:
-                loss = F.mse_loss(model(Xn_tr_t[b]), yb_tr_t[b])
+            loss = F.mse_loss(model(Xn_tr_t[b]), yb_tr_t[b])
             loss.backward()
             opt.step()
 
@@ -309,19 +242,12 @@ def train_one(prepared, method, condition, run_dir, seed=0, gamma=CENSOR_GAMMA,
 
     model.load_state_dict(torch.load(ckpt_path))
     model.eval()
-    model.stage_val_acc = None
-    if use_stages and hasattr(model, "forward_both"):
-        with torch.no_grad():
-            _p, logits = model.forward_both(Xn_va_t)
-        truth = torch.as_tensor(stages[rows_va], dtype=torch.long, device=device)
-        model.stage_val_acc = float((logits.argmax(-1) == truth).float().mean())
     return model, np.array(hist), best
 
 
 def run_all_combos(run_dir, dataset_path, methods=METHODS, conditions=CONDITIONS,
                    censor_schemes=CENSOR_SCHEMES, bootstrap_gamma=T2S_BOOTSTRAP_GAMMA,
-                   seed=SEED, device="cpu", verbose=True, n_stages=N_STAGES,
-                   stage_weight=STAGE_LOSS_WEIGHT):
+                   seed=SEED, device="cpu", verbose=True):
     """
     Train every (method x condition x censor_scheme) combination once.
     Saves normalization.npz + manifest.json. Returns (models, histories, rows).
@@ -354,8 +280,7 @@ def run_all_combos(run_dir, dataset_path, methods=METHODS, conditions=CONDITIONS
 
     prepared_by_scheme = {
         cs: load_and_prepare(dataset_path, censor_label=CENSOR_LABEL,
-                             censor_bootstrap=(cs == "bootstrap"),
-                             with_stages=bool(n_stages))
+                             censor_bootstrap=(cs == "bootstrap"))
         for cs in censor_schemes}
     prepared = prepared_by_scheme[censor_schemes[0]]      # for normalization stats
 
@@ -376,8 +301,7 @@ def run_all_combos(run_dir, dataset_path, methods=METHODS, conditions=CONDITIONS
                 model, hist, val_mse = train_one(
                     prep, method, condition, run_dir, seed=seed,
                     target_clip=target_clip, device=device, gamma=gamma,
-                    censor_bootstrap=boot, n_stages=n_stages,
-                    stage_weight=stage_weight)
+                    censor_bootstrap=boot)
                 models[combo] = model
                 histories[combo] = hist
                 summary_rows.append(dict(
@@ -389,7 +313,6 @@ def run_all_combos(run_dir, dataset_path, methods=METHODS, conditions=CONDITIONS
                     # carry a censored label, so the overall number partly scores
                     # agreement with a fiction.
                     val_mse_succ_only=float(hist[np.argmin(hist[:, 1]), 2]),
-                    stage_val_acc=getattr(model, "stage_val_acc", None),
                     # every consumer needs a seed to build the checkpoint filename
                     best_seed=seed))
 
@@ -400,8 +323,6 @@ def run_all_combos(run_dir, dataset_path, methods=METHODS, conditions=CONDITIONS
 
     manifest = dict(
         obs_dim=OBS_DIM, seed=seed, target_clip=target_clip,
-        # t2s_predict rebuilds the architecture from this
-        n_stages=int(n_stages), stage_loss_weight=float(stage_weight),
         normalization_file="normalization.npz",
         censor_schemes=list(censor_schemes), bootstrap_gamma=bootstrap_gamma,
         combos={r["combo"]: dict(
@@ -411,7 +332,6 @@ def run_all_combos(run_dir, dataset_path, methods=METHODS, conditions=CONDITIONS
                 f"{r['method']}{'boot' if r['censor_scheme'] == 'bootstrap' else ''}",
                 r["condition"], seed),
             val_mse=r["val_mse"], val_mse_succ_only=r["val_mse_succ_only"],
-            stage_val_acc=r.get("stage_val_acc"),
             best_seed=seed) for r in summary_rows})
     save_manifest(run_dir, manifest)
     return models, histories, summary_rows

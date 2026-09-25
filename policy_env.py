@@ -26,52 +26,14 @@ class Time2SuccessRewardWrapper(gym.Wrapper):
         self.predict_t2s = predict_t2s
         self.reward_mode = reward_mode
         self.time_penalty = time_penalty
-        # gamma MUST equal the learner's discount — see reward_fn. Threaded in
-        # rather than defaulted per-call so policy_train can pass the same
-        # value it gives SAC and VecNormalize, instead of three copies drifting.
         self.gamma = gamma
         if check_gamma_pred_max is not None:
             assert_shaping_gamma_safe(gamma=gamma, time_penalty=time_penalty,
                                       pred_max=check_gamma_pred_max,
                                       reward_mode=reward_mode)
-        # MetaWorld's peg-insert does NOT terminate on success — it runs to the
-        # 500-step truncation. With a per-step time penalty that means the agent
-        # keeps paying for time AFTER the task is complete, so in the post-success
-        # tail succeeding and failing earn identical reward (visible as a -1.0
-        # plateau on the SUCCESS trajectory in the reward preview).
-        # Terminating on success emulates the absorbing state the MDP should
-        # have, and matches how the T2S model was trained: t2s_targets sets
-        # terminal_value = 0 at the success frame, i.e. T(s_T) = 0. It also
-        # makes SAC bootstrap V = 0 after terminal, consistent with that target,
-        # and stops burning ~450 steps per episode on an already-solved task.
         self.terminate_on_success = terminate_on_success
         self._last_pred = None
         self._succeeded = False
-
-        # NO-PROGRESS TERMINATION (stall_steps > 0 enables it).
-        #
-        # End the episode with a TRUE terminal if the peg has not got closer to
-        # the goal for `stall_steps` consecutive steps. This fixes a tie that
-        # exists in pure `difference` mode: the 500-step limit is a truncation,
-        # SAC bootstraps through truncations, so hovering is valued as if it
-        # continued forever — and that value, sum of (1-gamma)*P discounted,
-        # equals P, exactly the value of succeeding. The policy is indifferent.
-        # Ending a stall with V=0 makes the hover branch finite, P*(1-gamma^K),
-        # so success strictly wins with no time penalty in the reward.
-        #
-        # PROGRESS, NOT MOTION. Stagnation is measured by peg-to-goal distance,
-        # never by the T2S prediction (a falsely optimistic model keeps its
-        # prediction falling while the arm is stuck, so it would never fire)
-        # and never by arm motion (a failing policy on the reference rollouts
-        # moved the arm AWAY from the peg rather than stopping, and was paid
-        # for it). Peg-to-goal only improves when the peg is actually carried.
-        #
-        # MUST be `terminated`, not `truncated`: SB3 bootstraps through
-        # truncation, which would silently restore the tie.
-        #
-        # stall_steps must exceed the legitimate approach phase — the peg does
-        # not move at all until it is grasped, ~20-30 steps into an expert
-        # success — or every episode is cut off before the grasp.
         self.stall_steps = int(stall_steps)
         self.stall_eps = float(stall_eps)
         self._best_peg_goal = None
@@ -96,12 +58,7 @@ class Time2SuccessRewardWrapper(gym.Wrapper):
             # already solved and (for some reason) still running: charge nothing
             reward = 0.0
         else:
-            # At the success frame the TRUE time-to-success is 0 by definition,
-            # and t2s_targets supervises it as 0 — but the model's prediction
-            # there is only approximately 0 (observed 2-5). Using the raw
-            # prediction makes the single most important transition in the
-            # episode pay an arbitrary amount, and leaves the potential
-            # discontinuous at the terminal state that SAC bootstraps V=0 from.
+
             terminal_pred = 0.0 if success_now else pred_now
             reward = step_reward(self._last_pred, terminal_pred,
                                  reward_mode=self.reward_mode,
