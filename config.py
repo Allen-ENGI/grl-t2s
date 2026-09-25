@@ -60,18 +60,6 @@ def steps_remaining_curve(n_states, success_step, censor_label=CENSOR_LABEL):
 #   policy-invariant when the gamma inside the shaping term equals the one
 #   the learner discounts with; three copies of this number (SAC, reward,
 #   VecNormalize) used to be able to drift apart independently.
-#
-#   Why 0.999 and not 0.99: the T2S model predicts an UNDISCOUNTED
-#   steps-to-go, so the potential Phi = -pred only matches a near-undiscounted
-#   MDP. With a constant prediction P (exactly the post-~150-step flatline
-#   this project observed), difference_timed pays
-#       r_hover = (1 - gamma) * P - time_penalty
-#   so hovering becomes PROFITABLE whenever (1-gamma)*P >= time_penalty:
-#       gamma=0.99,  P=200  ->  r_hover = +1.0   (freezing is rewarded)
-#       gamma=0.995, P=300  ->  r_hover = +0.5
-#       gamma=0.999, P=300  ->  r_hover = -0.7   (freezing costs)
-#   0.99 is also a 100-step effective horizon against 500-step episodes.
-#   reward_fn.assert_shaping_gamma_safe enforces the condition.
 RL_GAMMA = 0.999
 
 # T2S_BOOTSTRAP_GAMMA — unrelated to the above. Used only inside
@@ -80,10 +68,23 @@ RL_GAMMA = 0.999
 #   Pushing this to RL_GAMMA=0.999 would put the fixed point at 1000, far above
 #   T2S_PRED_CLIP_MAX, reinstating the arbitrary ceiling the bootstrap scheme
 #   exists to remove. Keep them separate.
-T2S_BOOTSTRAP_GAMMA = 0.99
+T2S_BOOTSTRAP_GAMMA = 0.995
 
 TIME_PENALTY = 1.0        # per-step cost for the minimum-time objective
 T2S_PRED_CLIP_MAX = 300.0  # predictions clipped to [0, this] in t2s_predict
+
+# ---- reference trajectories -----------------------------------------
+# Rolled once at the END of data collection and stored on disk, so every
+# downstream tool (t2s_eval, reward_preview, t2s_ordering, make_videos,
+# manual_drive) scores the SAME states instead of each re-rolling its own.
+REFERENCE_SEEDS = (900_001, 900_002, 900_003)   # far from any collection seed
+REFERENCE_KINDS = ("clean_success", "clean_failure",
+                   "perturbed_recovery", "perturbed_failure")
+# perturbation: this many random actions before the policy takes over. Expert
+# rollouts never leave the demonstration manifold, so expert-only references
+# cannot exercise the regime where the models were measured to misbehave.
+PERTURB_STEPS = 25
+REFERENCE_TAIL = 15       # frames kept after success; the rest is a finished task
 
 # ---- downstream RL ---------------------------------------------------
 RL_SEEDS = (0, 1, 2)      # 3 seeds: mean AND std across seeds is the point

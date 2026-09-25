@@ -7,6 +7,22 @@ Stage 2: Time2Success data collection.
 That is the whole API. Everything else in this module is either a pure helper
 (unit-tested without a sim) or a tuning constant at the top of the file.
 
+WHY SO FEW ARGUMENTS
+--------------------
+The previous version took 17. Eleven of them were not decisions anyone was
+making: the noise ladder used to find a failing policy, how many probe
+rollouts to run, the censor label (already in config), the checkpoint filename
+prefix (already in config), whether to force failure coverage (it must always
+be on — with no failed episodes the "succ" and "all" training conditions train
+byte-identical models, so Stage 2 measures nothing), and an
+`episodes_multiplier` that was a second knob for the same number as
+`n_episodes_per_checkpoint`.
+
+Those are now module constants below. Changing one is editing a named value in
+one place, which is clearer than threading it through three call sites and a
+CLI flag — and it makes the five real decisions visible instead of buried in a
+17-line signature.
+
 THE FIVE REAL DECISIONS
 -----------------------
   holdout    which checkpoints are RESERVED for Stage 4's held-out-policy
@@ -31,11 +47,13 @@ WHAT THE MODULE GUARANTEES
 import glob
 import os
 import warnings
+
 import numpy as np
 
 from config import (HAND_POS_IDX, PEG_POS_IDX, SUCCESS_KEY, MAX_STEPS,
                     CENSOR_LABEL, EXPERT_POLICY_DIR, TASK_SLUG,
-                    steps_remaining_curve)
+                    REFERENCE_SEEDS, REFERENCE_KINDS, PERTURB_STEPS,
+                    REFERENCE_TAIL, steps_remaining_curve)
 
 # ---- tuning constants: edit here, not via arguments ---------------------
 NOISE_LEVELS = (0.0, 0.15, 0.4)      # action noise per checkpoint; 0.0 is the clean pass
@@ -100,6 +118,21 @@ def assign_splits(episodes, val_fraction=DEFAULT_VAL_FRACTION, dedupe=True):
     """
     Assign each episode "train" or "val". Pure and deterministic, so two runs
     over the same episodes agree exactly.
+
+    Stratified by (source, succeeded): each stratum contributes its own share,
+    and a stratum of 2+ always contributes at least one — proportional
+    rounding alone starves small strata, and a failure stratum contributing
+    zero is exactly the "val has no failed episodes" hole this exists to close.
+
+    Selection is WEIGHTED by episode multiplicity, because choosing one
+    distinct trajectory sends all its duplicates to val; counting groups
+    instead of episodes let a heavy duplicate group push a requested 0.20 to
+    0.38.
+
+    dedupe=True routes identical observation sequences to the SAME split. This
+    is the leak GroupShuffleSplit could not prevent: it groups by episode id,
+    and identical trajectories carry different ids, so duplicates landed on
+    both sides and val MSE partly measured memorization.
     """
     n = len(episodes)
     splits = ["train"] * n
@@ -161,6 +194,13 @@ def assign_splits(episodes, val_fraction=DEFAULT_VAL_FRACTION, dedupe=True):
 def collect_episode(policy, env, seed=None, noise_std=0.0, rng=None):
     """
     One episode -> (obs_seq, flags, first_success).
+
+    The policy is always SAMPLED. There is no `deterministic` argument: the old
+    one was accepted and then ignored, and its only correct value was False.
+
+    INDEXING CONTRACT: obs_seq has T+1 states for T actions. flags[t] is the
+    flag returned by the step taking s_t -> s_{t+1}, so it describes s_{t+1}.
+    first_success is therefore t+1, the first state that IS successful.
     """
     rng = rng if rng is not None else np.random
     obs, _ = env.reset(seed=seed)
@@ -190,6 +230,11 @@ def discover_checkpoints(expert_dir=EXPERT_POLICY_DIR, holdout=()):
     """
     (eligible, reserved) checkpoint paths, weakest first, final last.
 
+    Parses only the filename SUFFIX after the prefix. An earlier sort key
+    concatenated every digit in the whole name, including digits inside
+    TASK_SLUG ("peg_insert_side_v3" contains a 3), so "..._v3_final.zip"
+    (key 3) could sort as EARLIER than "..._v3_100000.zip" (key 3100000),
+    silently treating the strongest checkpoint as the weakest.
     """
     reserved = {os.path.basename(_resolve(h, expert_dir)) for h in (holdout or ())}
     prefix_len = len(TASK_SLUG) + 1
@@ -249,6 +294,11 @@ def _failure_sources(scene, eligible, n_episodes, rng_seed=12345, verbose=True):
     """
     Probe the weakest share of eligible checkpoints and return the ones that
     measurably fail, as (path, noise, rate, episodes) tuples.
+
+    Several sources rather than one, because failure states are where the T2S
+    model extrapolates during Stage 5 — the regime where predictions of 62 vs
+    200 were observed on comparable trajectories. One source makes every
+    failed episode a variation on a single behaviour.
     """
     from stable_baselines3 import SAC
 
@@ -277,13 +327,140 @@ def _failure_sources(scene, eligible, n_episodes, rng_seed=12345, verbose=True):
     return [(ck, ns, rate, per) for ck, ns, rate in found]
 
 
+# ---- reference trajectories ---------------------------------------------
+
+def _roll_reference(policy, scene_factory, seed, perturb=0, tail=REFERENCE_TAIL):
+    """
+    One reference rollout with frames. `perturb` random actions are applied
+    first, then the policy takes over — expert rollouts never leave the
+    demonstration manifold, and that manifold is exactly where every model
+    measured fine and every downstream failure did not occur.
+    """
+    import torch
+
+    env = scene_factory(render_mode="rgb_array")
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    obs, _ = env.reset(seed=seed)
+
+    obs_list, frames, success_step = [], [], None
+    for t in range(MAX_STEPS):
+        obs_list.append(np.asarray(obs, dtype=np.float32).copy())
+        frames.append(env.render())
+        if t < perturb:
+            action = rng.uniform(env.action_space.low, env.action_space.high)
+        else:
+            action, _ = policy.predict(obs, deterministic=False)
+        obs, _r, term, trunc, info = env.step(action)
+        if info.get(SUCCESS_KEY, 0) and success_step is None:
+            success_step = t + 1
+        # stop shortly after success: MetaWorld does not terminate, and ~89% of
+        # a full 500-step successful episode is a peg already in the hole
+        if success_step is not None and t >= success_step + tail:
+            break
+        if term or trunc:
+            break
+    obs_list.append(np.asarray(obs, dtype=np.float32).copy())
+    frames.append(env.render())
+    env.close()
+    return (np.array(obs_list, dtype=np.float32), frames, success_step)
+
+
+def collect_references(run_dir, success_ckpt, failure_ckpt, expert_dir=EXPERT_POLICY_DIR,
+                       seeds=REFERENCE_SEEDS, verbose=True):
+    """
+    Roll the reference set ONCE and store it, so every downstream tool scores
+    identical states instead of re-rolling its own.
+
+    Four kinds, because expert-only references cannot exercise the regime the
+    models were found to misbehave in:
+        clean_success       strong policy, no perturbation
+        clean_failure       weak policy, no perturbation
+        perturbed_recovery  random actions, then the strong policy recovers
+        perturbed_failure   random actions, then the weak policy flounders
+
+    Stored per trajectory as <kind>_seed<N>.npz (obs, y_steps, success_step)
+    plus a matching .mp4. Frames go to video rather than into the npz: 120
+    frames of 480x640 RGB is ~111 MB raw and ~1.4 MB as h264, and every tool
+    that wants pixels can decode on demand.
+    """
+    import json
+
+    from stable_baselines3 import SAC
+    from env_utils import make_fixed_scene_env
+    from t2s_video import save_video
+
+    out_dir = os.path.join(run_dir, "references")
+    os.makedirs(out_dir, exist_ok=True)
+    pol = {"success": SAC.load(_resolve(success_ckpt, expert_dir)),
+           "failure": SAC.load(_resolve(failure_ckpt, expert_dir))}
+    plan = {"clean_success": ("success", 0), "clean_failure": ("failure", 0),
+            "perturbed_recovery": ("success", PERTURB_STEPS),
+            "perturbed_failure": ("failure", PERTURB_STEPS)}
+
+    index = []
+    for kind in REFERENCE_KINDS:
+        who, perturb = plan[kind]
+        for sd in seeds:
+            obs, frames, ss = _roll_reference(pol[who], make_fixed_scene_env, sd,
+                                              perturb=perturb)
+            name = f"{kind}_seed{sd}"
+            np.savez(os.path.join(out_dir, name + ".npz"), obs=obs,
+                     y_steps=steps_remaining_curve(len(obs), ss),
+                     success_step=np.array([-1 if ss is None else ss]))
+            try:
+                save_video(frames, os.path.join(out_dir, name + ".mp4"))
+                has_video = True
+            except Exception as e:      # imageio/ffmpeg missing: obs still usable
+                has_video = False
+                if verbose:
+                    print(f"    (no video for {name}: {e})")
+            index.append(dict(name=name, kind=kind, seed=int(sd), policy=who,
+                              perturb_steps=perturb, n_frames=len(obs),
+                              success_step=None if ss is None else int(ss),
+                              video=has_video))
+            if verbose:
+                print(f"  {name:<34}{len(obs):>4} frames  "
+                      + (f"success@{ss}" if ss is not None else "never succeeded"))
+
+    with open(os.path.join(out_dir, "index.json"), "w") as f:
+        json.dump(dict(success_ckpt=os.path.basename(_resolve(success_ckpt, expert_dir)),
+                       failure_ckpt=os.path.basename(_resolve(failure_ckpt, expert_dir)),
+                       seeds=[int(s) for s in seeds], perturb_steps=PERTURB_STEPS,
+                       trajectories=index), f, indent=2)
+    return index
+
+
 # ---- the entry point ----------------------------------------------------
 
 def collect(run_dir, holdout=(), episodes=80, seeds=(0, 1, 2),
             val_fraction=DEFAULT_VAL_FRACTION, expert_dir=EXPERT_POLICY_DIR,
-            verbose=True):
+            references=True, reference_policies=None, verbose=True):
     """
     Collect a T2S dataset into run_dir. Writes dataset.npz + dataset_summary.json.
+
+    references: roll and store the reference trajectory set after collection.
+              Every downstream tool then scores identical states.
+
+    reference_policies: (success_ckpt, failure_ckpt) for the reference rollouts.
+              Defaults to the strongest and weakest discovered checkpoint.
+              These are NO LONGER required to be held out — see `holdout`.
+
+    holdout:  checkpoints RESERVED for Stage 4's held-out-policy evaluation and
+              therefore not collected from. "Collect from every checkpoint" and
+              "evaluate on policies that generated none of the training data"
+              cannot both hold for the same file, so the reservation is
+              explicit and recorded for t2s_eval.assert_policies_held_out to
+              check. It is honoured by the failure sourcing too — that used to
+              pick from the full list and could have collected 30 episodes
+              from a reserved policy.
+    episodes: clean episodes per checkpoint, per seed. Noisy and failure
+              batches are sized as shares of it (see the constants above).
+    seeds:    independent passes, each with its own RNG and a disjoint
+              env-reset seed block. The main diversity knob.
+
+    dataset.npz arrays, all row-aligned:
+        X, y_steps, episode_ids, frame_idxs, collection_seeds, split
     """
     import json
 
@@ -373,6 +550,14 @@ def collect(run_dir, holdout=(), episodes=80, seeds=(0, 1, 2),
                               measured_success_rate=r, episodes=n)
                          for c, ns, r, n in fail_sources],
     )
+    if references:
+        if verbose:
+            print("\nrolling reference trajectories:")
+        sc, fc = reference_policies or (eligible[-1], eligible[0])
+        summary["references"] = collect_references(run_dir, sc, fc,
+                                                   expert_dir=expert_dir,
+                                                   verbose=verbose)
+
     with open(os.path.join(run_dir, "dataset_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 

@@ -1,53 +1,43 @@
 #!/usr/bin/env python3
 """
-STAGE 3 of 4 — T2S evaluation.
+STAGE 3 of 4 - T2S evaluation.
 
     python run_3_eval.py --t2s-run v3
 
-Scores every model Stage 2 trained against held-out POLICIES and held-out
-ROWS, and writes the manifest run_4_policy.py reads. Trains nothing, so it is
-cheap to re-run for a different metric or more rollout seeds.
+Scores every model Stage 2 trained and writes the manifest run_4_policy.py
+reads. Trains nothing, so it is cheap to re-run.
 
-NUMBERS AND CHARTS ONLY. Video lives in make_videos.py, which takes its own
-model list and reward mode. They were one script, which meant re-rendering
-footage to try a different reward mode also re-ran the whole evaluation, and
-choosing which models to film meant editing an evaluation script. --video
-still renders here for convenience; make_videos.py is the flexible path.
+NUMBERS AND CHARTS ONLY. Video lives in make_videos.py; --video still renders
+here for convenience, but make_videos.py is the flexible path.
 
-This script is orchestration only — every number comes from t2s_eval and
-every frame from t2s_video, the same functions the notebook cells call.
+WHAT IS HELD OUT
+----------------
+Held-out EPISODES: the `val` split fixed at collection time, stratified across
+every source. Reserving whole CHECKPOINTS was dropped - it cost every one of
+their failure modes in exchange for a generalisation claim that did not probe
+the regime that matters, since neither reserved expert resembles an untrained
+policy. assert_policies_held_out is now advisory, not a gate.
 
-TWO KINDS OF "HELD OUT"
+THE FOUR METRICS
+----------------
+  mae                   does it predict TIME correctly, on success rollouts
+  step_slope_error      is the per-step DECREMENT right - literally what the
+                        shaped reward consumes. 1.0 = no better than flat
+  dead_window_fraction  any gradient at all, or sustained flat runs
+  fail_pred_min         does it stay pessimistic on a trajectory that NEVER
+                        succeeds. LOW IS BAD
+
+MAE IS NOT THE SELECTOR
 -----------------------
-  ROWS      the `val` split fixed at collection time. Thousands of states,
-            but the same policies that generated training data. Tests
-            interpolation. This is what Stage 2's val MSE already ranked.
-  POLICIES  checkpoints reserved by Stage 1's --holdout and never rolled out.
-            Tests generalization to unseen behaviour — the stronger claim,
-            and it can rank differently from val MSE.
-The evaluation policies are DERIVED from Stage 1's recorded holdout, not
-retyped: strongest reserved checkpoint reliably succeeds, weakest reliably
-fails. assert_policies_held_out then verifies neither was collected from.
+It is measured only on success rollouts, where models trained on success data
+specialise, and across the observed grid it correlated +0.68 with
+fail_pred_min: better success accuracy went with WORSE failure behaviour. The
+best-MAE model scored fail_pred_min 4.11 - four steps to success on a rollout
+that never succeeds. So models are ranked by t2s_eval.rank_models: reject
+false optimism first, then rank the survivors by MAE. Stage 4 applies the same
+threshold, so the two stages cannot recommend different models.
 
-READING THE TABLE
------------------
-Within one success rollout the truth is a straight ramp in the frame index,
-so correlating predictions against it is correlating against -t: a model with
-a 3x wrong scale or a +100 offset still scored a perfect 1.000, and any
-decreasing curve scored ~0.99. What replaced that column:
-
-  bias               signed. NEGATIVE = claims success is nearer than it is,
-                     the dangerous direction for a reward.
-  calibration_slope  1.0 is correct. With bias, the only metrics that see a
-                     global offset or scale error — no correlation can.
-  step_slope_error   mean |predicted decrement - 1|; literally the quantity
-                     the shaped reward consumes. A model can have excellent
-                     MAE and a useless step slope.
-  pooled_spearman    across rollouts; sees a level consistent within each
-                     trajectory but drifting between them.
-  monotonicity_rho   the old correlation, renamed. Shape only.
-
-Exit codes: 0 ok, 1 Stage 2's output is missing or the held-out claim failed.
+Exit codes: 0 ok, 1 Stage 2's output is missing.
 """
 import argparse
 import json
@@ -64,25 +54,31 @@ def parse_args(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--t2s-run", required=True, help="run name from run_2_train.py")
     p.add_argument("--eval-seeds", type=int, default=8,
-                   help="held-out-policy rollouts per model; these DO vary")
+                   help="rollouts per model; these DO vary")
     p.add_argument("--models", nargs="+", default=None,
                    help="subset of combos to score (default: all trained)")
     p.add_argument("--video", action="store_true", default=False,
                    help="also render videos (make_videos.py is the flexible path)")
     p.add_argument("--video-seed", type=int, default=500)
+    p.add_argument("--score-on", default="rollouts", choices=["rollouts", "val"],
+                   help="'val' scores the held-out val EPISODES from dataset.npz "
+                        "instead of 8 live rollouts: dozens of complete "
+                        "trajectories, no simulator, seconds. Live rolling was "
+                        "justified when Stage 1 reserved checkpoints; that holdout "
+                        "is gone, so the reference policies were collected from too "
+                        "and the rollouts are no longer a different distribution, "
+                        "just a smaller one.")
     return p.parse_args(argv)
 
 
 def pick_eval_policies(holdout):
     """
-    Split Stage 1's holdout into (success_policy, failure_policy) by training
-    step. Derived rather than typed, so it cannot disagree with what
-    collection actually reserved — these two had to match --holdout exactly or
-    the held-out assertion fails, and asking for the same filenames twice was
-    an invitation to get it wrong.
+    Split a recorded holdout into (success_policy, failure_policy) by training
+    step. Only used when a run has no stored reference set; the references
+    record which checkpoints produced them, so nothing has to be inferred.
     """
     if len(holdout) < 2:
-        raise ValueError(f"need 2 held-out checkpoints, Stage 1 reserved {holdout}")
+        raise ValueError(f"need 2 held-out checkpoints, got {holdout}")
 
     def step(name):
         m = re.search(r"_(\d+)\.zip$", name)
@@ -110,8 +106,8 @@ def main(argv=None):
         return 1
     mpath = os.path.join(t2s_dir, STAGE_MANIFEST)
     if not os.path.exists(mpath):
-        print(f"ERROR: no {STAGE_MANIFEST} in {t2s_dir} — training did not finish, or "
-              "that run predates the staged scripts.", file=sys.stderr)
+        print(f"ERROR: no {STAGE_MANIFEST} in {t2s_dir} - training did not finish.",
+              file=sys.stderr)
         return 1
     with open(mpath) as f:
         stage2 = json.load(f)
@@ -124,22 +120,36 @@ def main(argv=None):
         return 1
     rows = [dict(combo=c, best_seed=stage2["combos"][c]["best_seed"]) for c in combos]
 
-    succ_name, fail_name = pick_eval_policies(stage2["holdout_checkpoints"])
+    # prefer the stored reference set; fall back to the holdout-derived policies
+    ref_dir = os.path.join(os.path.dirname(stage2["dataset_path"]), "references")
+    use_refs = os.path.exists(os.path.join(ref_dir, "index.json"))
+    if use_refs:
+        with open(os.path.join(ref_dir, "index.json")) as f:
+            ridx = json.load(f)
+        succ_name, fail_name = ridx["success_ckpt"], ridx["failure_ckpt"]
+    else:
+        succ_name, fail_name = pick_eval_policies(stage2["holdout_checkpoints"])
     print(f"=== Stage 3: evaluating {len(rows)} model(s) from {args.t2s_run} ===")
-    print(f"    held out: success={succ_name}  failure={fail_name}\n")
+    print(f"    reference policies: success={succ_name}  failure={fail_name}")
+    # The reference index is used only to NAME the checkpoints. Scoring still
+    # re-rolls them live (t2s_eval._rollout, seeds 500-507), so the earlier
+    # "STORED (identical across every tool)" message was false: the stored
+    # observations are used by reward_preview and the video tools, not here.
+    print("    rollouts: re-rolled live, seeds 500-"
+          f"{500 + args.eval_seeds - 1}"
+          + ("  (checkpoints named by the stored reference index)" if use_refs
+             else "  (checkpoints from the recorded holdout)") + "\n")
 
-    # ---- verify the held-out claim --------------------------------------
     from stable_baselines3 import SAC
 
     succ_path = os.path.join(config.EXPERT_POLICY_DIR, succ_name)
     fail_path = os.path.join(config.EXPERT_POLICY_DIR, fail_name)
-    try:
-        t2s_eval.assert_policies_held_out(stage2["dataset_summary_path"],
-                                          [succ_path, fail_path])
-        print("held-out check: ok, neither policy was collected from")
-    except AssertionError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 1
+    # advisory, not a gate: Stage 3 measures held-out EPISODES (the val split,
+    # stratified across every source) rather than held-out policies
+    held = t2s_eval.assert_policies_held_out(stage2["dataset_summary_path"],
+                                             [succ_path, fail_path], strict=False)
+    print("held-out episodes via the val split"
+          + ("" if held["ok"] else "; reference policies were also collected from"))
 
     succ_pol, fail_pol = SAC.load(succ_path), SAC.load(fail_path)
     eval_dir = results.new_run_dir(
@@ -147,10 +157,13 @@ def main(argv=None):
         meta=dict(stage="3_eval", t2s_run=args.t2s_run, data_run=stage2["data_run"]))
 
     # ---- score -----------------------------------------------------------
-    print(f"\nscoring ({args.eval_seeds} rollouts each) -> {eval_dir}")
+    print("\nscoring on "
+          + (f"{args.eval_seeds} live rollouts each" if args.score_on == "rollouts"
+             else "held-out val EPISODES from dataset.npz")
+          + f" -> {eval_dir}")
     reports = t2s_eval.evaluate_runs(
         t2s_dir, rows, succ_pol, fail_pol, n_seeds=args.eval_seeds,
-        dataset_path=stage2["dataset_path"])       # also the held-out-ROWS check
+        dataset_path=stage2["dataset_path"], score_on=args.score_on)
 
     with open(os.path.join(eval_dir, "eval_report.json"), "w") as f:
         json.dump(reports, f, indent=2)
@@ -158,14 +171,26 @@ def main(argv=None):
     print()
     print(t2s_eval.format_report_table(reports, sort_by="mae"))
 
-    # val MSE ranked fit to held-out ROWS; this ranks held-out POLICIES.
-    # Disagreement between them is informative, not a bug.
-    print(f"\n{'combo':<22}{'val MSE (rows)':>16}{'MAE (policies)':>16}")
-    print("-" * 54)
+    # THREE views of the same models, on different data:
+    #   val MSE         Stage 2's own number, held-out ROWS at training time
+    #   val MAE/bias    held-out EPISODES from dataset.npz: thousands of
+    #                   collected states never trained on. Computed all along
+    #                   by evaluate_on_val_split and never displayed.
+    #   rollout MAE     eight LIVE rollouts of the reference policies
+    # Disagreement between them is informative, not a bug: the val split is a
+    # bigger sample, the rollouts are the more realistic one.
+    n_val = (reports[combos[0]].get("val_split") or {}).get("n")
+    print(f"\nheld-out EPISODES ({n_val:,} val rows) vs LIVE rollouts"
+          if n_val else "\nheld-out rows vs live rollouts")
+    print(f"{'combo':<22}{'val MSE':>10}{'val MAE':>10}{'val bias':>10}"
+          f"{'rollout MAE':>13}")
+    print("-" * 65)
     for c in sorted(combos, key=lambda c: stage2["combos"][c]["val_mse"]):
+        v = reports[c].get("val_split") or {}
         mae = reports[c].get("summary", {}).get("mae")
-        print(f"{c:<22}{stage2['combos'][c]['val_mse']:>16.2f}"
-              f"{(f'{mae:.2f}' if mae is not None else '--'):>16}")
+        f = lambda x, d=2: "--" if x is None else f"{x:.{d}f}"
+        print(f"{c:<22}{stage2['combos'][c]['val_mse']:>10.2f}"
+              f"{f(v.get('mae')):>10}{f(v.get('bias')):>10}{f(mae):>13}")
 
     try:
         t2s_eval.plot_combo_comparison(
@@ -185,7 +210,6 @@ def main(argv=None):
             c: t2s_predict.load_t2s_predictor(t2s_dir, *c.rsplit("_", 1),
                                               seed=stage2["combos"][c]["best_seed"])
             for c in combos}
-
         for combo, fn in predictors.items():
             _rep, v = t2s_video.evaluate_with_video(
                 fn, succ_pol, fail_pol, video_dir, label=combo,
@@ -193,8 +217,7 @@ def main(argv=None):
             videos[combo] = v
 
         # every model on the SAME frames, so a divergence is the model and not
-        # the rollout. Whichever readout turns red is the model that would have
-        # paid the policy to keep hovering.
+        # the rollout
         roll = t2s_video.rollout_with_frames(fail_pol, seed=args.video_seed)
         _f, cmp_info = t2s_video.render_model_comparison_video(
             roll, predictors, save_path=os.path.join(video_dir, "all_models_failure.mp4"))
@@ -211,17 +234,23 @@ def main(argv=None):
         combos={c: dict(best_seed=stage2["combos"][c]["best_seed"],
                         val_mse=stage2["combos"][c]["val_mse"],
                         eval={k: reports[c].get("summary", {}).get(k)
-                              for k in ("mae", "bias", "calibration_slope",
-                                        "step_slope_error", "pooled_spearman",
-                                        "pred_max")})
+                              for k in t2s_eval.REPORT_METRICS
+                              + ("bias", "calibration_slope", "pred_max")},
+                        val_split=reports[c].get("val_split"))
                 for c in combos},
         videos=videos, ok=True)
     with open(os.path.join(eval_dir, STAGE_MANIFEST), "w") as f:
         json.dump(manifest, f, indent=2)
 
-    best = sorted(combos, key=lambda c: reports[c].get("summary", {}).get("mae")
-                  if reports[c].get("summary", {}).get("mae") is not None else float("inf"))[:2]
+    # the SAME rule Stage 4 applies. Ranking by MAE here used to recommend
+    # models Stage 4 then refused - and the top-MAE model was the most falsely
+    # optimistic one in the grid.
+    best, rejected, reason = t2s_eval.rank_models(reports, n=2)
     print(f"\nwrote {os.path.join(eval_dir, STAGE_MANIFEST)}")
+    print(f"\nselection: {reason}")
+    if rejected:
+        print(f"  rejected for false optimism (fail_pred_min < "
+              f"{t2s_eval.MIN_FAIL_PRED:.0f}): {sorted(rejected)}")
     print(f"next:  python run_4_policy.py --eval-run {args.t2s_run} "
           f"--models {' '.join(best)}")
     return 0

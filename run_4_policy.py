@@ -71,11 +71,39 @@ def parse_args(argv=None):
     p.add_argument("--seeds", type=int, nargs="+", default=None,
                    help="RL seeds (default: config.RL_SEEDS = 0 1 2)")
     p.add_argument("--sweep-name", default="sweep_v6")
-    p.add_argument("--reward-mode", default="difference_timed",
+    p.add_argument("--reward-mode", default="difference",
                    choices=["absolute", "difference", "difference_timed"])
     p.add_argument("--gamma", type=float, default=None,
                    help="RL discount (default: config.RL_GAMMA)")
     p.add_argument("--timesteps", type=int, default=400_000)
+    p.add_argument("--no-norm-reward", dest="norm_reward", action="store_false",
+                   default=True,
+                   help="train on the RAW T2S reward instead of passing it through "
+                        "VecNormalize. VecNormalize divides by a RUNNING std of the "
+                        "discounted return, which drifts as the policy improves, so "
+                        "the reward the critic learns from changes scale underneath "
+                        "it. The expert checkpoints were trained on a fixed-scale "
+                        "reward with no normalisation. The T2S reward is already "
+                        "small (std ~0.9 per step), so it does not need rescaling.")
+    p.add_argument("--time-penalty", type=float, default=None,
+                   help="per-step time penalty (default: config.TIME_PENALTY). 0 gives "
+                        "pure difference shaping, pred(s) - gamma*pred(s'). Note the "
+                        "gate will FAIL it: with no penalty a constant prediction pays "
+                        "(1-gamma)*pred > 0 per step, i.e. hovering is rewarded.")
+    p.add_argument("--stall-steps", type=int, default=0,
+                   help="end a TRAINING episode (true terminal, V=0) if the peg has not "
+                        "moved closer to the goal for this many steps. 0 = off. Fixes "
+                        "the hovering tie in `difference` mode without a time penalty. "
+                        "Must exceed the approach phase — the peg does not move until "
+                        "grasped, ~20-30 steps into an expert success — so 100 is a "
+                        "safe start. Does NOT fix a model that pays for moving the arm "
+                        "away from the peg: the arm is not stalled there.")
+    p.add_argument("--ent-coef", default="auto",
+                   help="'auto' learns alpha toward --target-entropy; a float pins it")
+    p.add_argument("--target-entropy", default="auto",
+                   help="'auto' = -dim(action) = -4. A HIGHER value (e.g. -2) keeps "
+                        "the policy more stochastic for longer, which is the knob "
+                        "for a narrow action window like closing the gripper.")
     p.add_argument("--preview-only", action="store_true",
                    help="run the gate and stop; no training")
     p.add_argument("--gamma-sweep", type=float, nargs="*", default=None,
@@ -103,13 +131,16 @@ def _load_predictors(t2s_run_dir, combos, manifest):
     return specs, predictors
 
 
-def run_gate(trajectories, predictors, reward_mode, gamma, verbose=True):
+def run_gate(trajectories, predictors, reward_mode, gamma, verbose=True,
+             time_penalty=None):
     """Reward preview + pass/fail verdict. Returns (verdicts, pred_maxes)."""
     import reward_preview
 
     preview = reward_preview.preview_reward(
-        trajectories, predictors, reward_modes=(reward_mode,), gamma=gamma)
-    verdicts = reward_preview.check_preview(preview, reward_mode)
+        trajectories, predictors, reward_modes=(reward_mode,), gamma=gamma,
+        time_penalty=time_penalty)
+    verdicts = reward_preview.check_preview(preview, reward_mode,
+                                            time_penalty=time_penalty)
     if verbose:
         print(reward_preview.format_preview_table(preview))
     return verdicts, {k: v["pred_max"] for k, v in verdicts.items()}
@@ -146,16 +177,33 @@ def main(argv=None):
     if not combos:
         # rank by held-out-POLICY MAE, which is what Stage 3 measured; val MSE
         # ranks held-out ROWS and can disagree
-        def mae(c):
-            v = stage3["combos"][c]["eval"].get("mae")
-            return float("inf") if v is None else v
-        combos = sorted(stage3["combos"], key=mae)[:args.n_best]
-        print(f"(no --models given; took best {len(combos)} by held-out MAE: {combos})")
+        # MAE alone is the wrong selector: the best predictor measured on
+        # expert success rollouts was also the most falsely optimistic on
+        # failures (fail_pred_min 4.11 — it claims 4 steps to success on a
+        # trajectory that never succeeds). Filter on the reward-relevant number
+        # FIRST, then rank the survivors by MAE.
+        def ev(c, k, default):
+            v = stage3["combos"][c]["eval"].get(k)
+            return default if v is None else v
+
+        # threshold lives in t2s_eval so Stage 3 and Stage 4 cannot disagree
+        thr = t2s_eval.MIN_FAIL_PRED
+        ok = [c for c in stage3["combos"] if ev(c, "fail_pred_min", 0.0) >= thr]
+        if not ok:
+            ok = list(stage3["combos"])
+            print(f"(no model has fail_pred_min >= {thr}; ranking all by MAE)")
+        else:
+            print(f"({len(ok)} of {len(stage3['combos'])} models pass "
+                  f"fail_pred_min >= {thr})")
+        combos = sorted(ok, key=lambda c: ev(c, "mae", float("inf")))[:args.n_best]
+        print(f"(no --models given; took best {len(combos)} by MAE among those: {combos})")
 
     specs, predictors = _load_predictors(t2s_run_dir, combos, stage3)
     print(f"\n=== Stage 4: {len(specs)} model(s) x {len(seeds)} seed(s) = "
           f"{len(specs)*len(seeds)} runs @ {args.timesteps:,} steps ===")
-    print(f"    reward_mode={args.reward_mode}  RL gamma={gamma}")
+    print(f"    reward_mode={args.reward_mode}  RL gamma={gamma}  "
+          f"reward normalisation={'VecNormalize' if args.norm_reward else 'OFF (raw)'}"
+          f"  stall termination={args.stall_steps or 'off'}")
     for label, (_d, combo, sd) in specs.items():
         ev = stage3["combos"][combo]["eval"]
         print(f"    {label:<28} t2s seed {sd}  mae={ev.get('mae')}  "
@@ -179,7 +227,8 @@ def main(argv=None):
               f"{'hover@obs':>11}{'hover@ceil':>12}   verdict")
         print("-" * 84)
         for g in gammas:
-            v, _ = run_gate(trajectories, predictors, args.reward_mode, g, verbose=False)
+            v, _ = run_gate(trajectories, predictors, args.reward_mode, g, verbose=False,
+                            time_penalty=args.time_penalty)
             for label, d in v.items():
                 gap = f"{d['return_gap']:,.0f}" if d["return_gap"] is not None else "--"
                 verdict = "PASS" if d["ok"] else "FAIL"
@@ -196,7 +245,8 @@ def main(argv=None):
         print(f"  {scenario}: " + ", ".join(
             f"seed{t['seed']} {len(t['obs'])}st succ@{t['success_step']}" for t in trajs))
     print()
-    verdicts, pred_maxes = run_gate(trajectories, predictors, args.reward_mode, gamma)
+    verdicts, pred_maxes = run_gate(trajectories, predictors, args.reward_mode, gamma,
+                                    time_penalty=args.time_penalty)
 
     print(f"\n--- verdict for {args.reward_mode} ---")
     failed = []
@@ -225,7 +275,12 @@ def main(argv=None):
     sweep_results = policy_train.run_sweep(
         specs, results, seeds=seeds, sweep_name=args.sweep_name,
         reward_mode=args.reward_mode, total_timesteps=args.timesteps, gamma=gamma,
-        pred_maxes=pred_maxes,         # real prediction range -> real hovering check
+        pred_maxes=pred_maxes, force=args.force, norm_reward=args.norm_reward,
+        stall_steps=args.stall_steps,
+        **({} if args.time_penalty is None else {"time_penalty": args.time_penalty}),
+        ent_coef=(float(args.ent_coef) if args.ent_coef != "auto" else "auto"),
+        target_entropy=(float(args.target_entropy)
+                        if args.target_entropy != "auto" else "auto"),
         skip_existing=True, eval_freq=EVAL_FREQ, ckpt_freq=CKPT_FREQ,
         n_eval_episodes=N_EVAL_EPISODES)
 

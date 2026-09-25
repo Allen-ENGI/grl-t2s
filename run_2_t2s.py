@@ -74,11 +74,13 @@ def main(argv=None):
               f"Registered: {results.list_runs('data_collection')}\n"
               f"Run:  python run_1_collect.py --run-name {args.data_run}", file=sys.stderr)
         return 1
+    
     manifest_path = os.path.join(data_dir, STAGE_MANIFEST)
     if not os.path.exists(manifest_path):
         print(f"ERROR: no {STAGE_MANIFEST} in {data_dir} — that run predates the "
               "staged scripts, or collection did not finish.", file=sys.stderr)
         return 1
+    
     with open(manifest_path) as f:
         stage1 = json.load(f)
     if not stage1.get("ok"):

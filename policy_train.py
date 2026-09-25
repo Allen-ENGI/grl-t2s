@@ -25,7 +25,8 @@ def train_policy(run_dir, predict_t2s, reward_mode="difference_timed", total_tim
                  n_envs=6, eval_freq=10_000, ckpt_freq=50_000, n_eval_episodes=5,
                  seed=0, smoke_test_steps=3_000, time_penalty=TIME_PENALTY,
                  gamma=RL_GAMMA, terminate_on_success=True, norm_reward=True,
-                 pred_max_for_gamma_check=None):
+                 pred_max_for_gamma_check=None, ent_coef="auto",
+                 target_entropy="auto", stall_steps=0):
     """
     Trains SAC against the T2S reward. `predict_t2s` should come from
     t2s_predict.load_t2s_predictor so the frozen model / normalization
@@ -40,9 +41,14 @@ def train_policy(run_dir, predict_t2s, reward_mode="difference_timed", total_tim
         assert_shaping_gamma_safe(gamma=gamma, time_penalty=time_penalty,
                                   pred_max=pred_max_for_gamma_check, reward_mode=reward_mode)
 
+    # stall termination is applied to TRAINING envs only. The eval env keeps the
+    # full 500 steps so success_rate stays comparable across runs with and
+    # without it — otherwise a slow-but-eventual success could be cut short and
+    # scored as a failure, which would make the flag look worse than it is.
     train_env = VecMonitor(DummyVecEnv(
         [make_policy_train_env(predict_t2s, reward_mode, time_penalty=time_penalty,
-                               gamma=gamma, terminate_on_success=terminate_on_success)
+                               gamma=gamma, terminate_on_success=terminate_on_success,
+                               stall_steps=stall_steps)
          for _ in range(n_envs)]))
     # VecNormalize keeps a running std of the DISCOUNTED return, so it has its
     # own gamma; leaving it at the 0.99 default while SAC ran at another value
@@ -58,7 +64,11 @@ def train_policy(run_dir, predict_t2s, reward_mode="difference_timed", total_tim
         train_env, eval_env, run_dir, total_timesteps=total_timesteps, ckpt_prefix="policy",
         eval_freq=eval_freq, ckpt_freq=ckpt_freq, n_eval_episodes=n_eval_episodes,
         smoke_test_steps=smoke_test_steps, seed=seed, gamma=gamma,
-        sac_kwargs=dict(buffer_size=300_000),
+        # ent_coef="auto" LEARNS alpha to hit target_entropy, which SB3
+        # defaults to -dim(action) = -4. Raising the target (e.g. -2) keeps the
+        # policy more stochastic for longer; a fixed float pins alpha instead.
+        sac_kwargs=dict(buffer_size=300_000, ent_coef=ent_coef,
+                        target_entropy=target_entropy),
     )
     train_env.save(os.path.join(run_dir, "vecnormalize.pkl"))
     return model, history
@@ -84,7 +94,8 @@ def load_vecnormalize(run_dir, venv):
 
 def run_sweep(model_specs, results_module, seeds=RL_SEEDS, sweep_name="sweep_v1",
               reward_mode="difference_timed", total_timesteps=400_000,
-              gamma=RL_GAMMA, skip_existing=True, pred_maxes=None, **train_kwargs):
+              gamma=RL_GAMMA, skip_existing=True, pred_maxes=None, force=False,
+              **train_kwargs):
     """
     Trains one policy per (model, seed) pair.
 
@@ -112,7 +123,9 @@ def run_sweep(model_specs, results_module, seeds=RL_SEEDS, sweep_name="sweep_v1"
     """
     import t2s_predict
 
-    pred_maxes = pred_maxes or {}
+    # --force bypasses the gate in run_4_policy, but train_policy re-ran the
+    # same hovering assertion and raised anyway, so the flag did not work.
+    pred_maxes = {} if force else (pred_maxes or {})
     sweep_results = {}
     total = len(model_specs) * len(seeds)
     i = 0
@@ -133,7 +146,11 @@ def run_sweep(model_specs, results_module, seeds=RL_SEEDS, sweep_name="sweep_v1"
                           timesteps=total_timesteps))
 
             history_path = os.path.join(run_dir, "eval_history.json")
-            if skip_existing and os.path.exists(history_path):
+            # a non-empty history is NOT evidence of a finished run: a smoke
+            # test writes one, and so does a crash at 20k of 400k. The final
+            # checkpoint is the only thing train_sac writes on completion.
+            finished = os.path.exists(os.path.join(run_dir, "policy_final.zip"))
+            if skip_existing and os.path.exists(history_path) and finished:
                 with open(history_path) as f:
                     existing = json.load(f)
                 if existing:
@@ -208,7 +225,12 @@ def summarize_sweep(sweep_results):
             best_min_peg_goal_distance=float(np.min(peg_best)) if peg_best else None,
             best_min_hand_peg_distance=float(np.min(hand_best)) if hand_best else None,
             mean_control_rate=float(np.mean(ctrl)) if ctrl else None,
-            peg_moved_rate=float(np.max(moved)) if moved else None,
+            # best-case across seeds, kept but NAMED as such. The mean is what
+            # a sweep is for; a max over seeds is an estimate of luck.
+            best_peg_moved_rate=float(np.max(moved)) if moved else None,
+            mean_peg_moved_rate=float(np.mean(moved)) if moved else None,
+            std_peg_moved_rate=float(np.std(moved)) if moved else None,
+            peg_moved_rate=float(np.mean(moved)) if moved else None,
         ))
     # rank by success first, then by how close the peg got — so all-zero-success
     # sweeps still produce a meaningful ordering instead of an arbitrary one

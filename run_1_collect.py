@@ -32,11 +32,21 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Stage 1: T2S data collection",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--run-name", default="v2", help="run name; run_2 is pointed at this")
-    p.add_argument("--holdout", nargs="*", default=[
-                       "peg_insert_side_v3_700000.zip",    # Stage 4 success policy
-                       "peg_insert_side_v3_200000.zip"],   # Stage 4 failure policy
-                   help="checkpoints RESERVED for Stage 4; never collected from")
+    p.add_argument("--run-name", default="v3", help="run name; run_2 is pointed at this")
+    p.add_argument("--holdout", nargs="*", default=[],
+                   help="checkpoints to RESERVE and not collect from. Now EMPTY by "
+                        "default: reserving whole checkpoints cost every one of "
+                        "their failure modes, which are checkpoint-specific, in "
+                        "exchange for a generalisation claim that did not probe "
+                        "the regime that matters — neither reserved expert "
+                        "resembles an untrained policy. Validation now comes from "
+                        "held-out EPISODES (--val), stratified across every source.")
+    p.add_argument("--reference-policies", nargs=2, default=None,
+                   metavar=("SUCCESS_CKPT", "FAILURE_CKPT"),
+                   help="policies for the stored reference trajectories "
+                        "(default: strongest and weakest discovered)")
+    p.add_argument("--no-references", dest="references", action="store_false",
+                   default=True, help="skip the stored reference set")
     p.add_argument("--episodes", type=int, default=80,
                    help="clean episodes per checkpoint per seed; noisy and "
                         "failure batches are sized as shares of this")
@@ -68,7 +78,10 @@ def main(argv=None):
 
     summary = data_collection.collect(
         run_dir, holdout=args.holdout, episodes=args.episodes,
-        seeds=tuple(args.seeds), val_fraction=args.val)
+        seeds=tuple(args.seeds), val_fraction=args.val,
+        references=args.references,
+        reference_policies=tuple(args.reference_policies)
+        if args.reference_policies else None)
 
     print("\n=== audit ===")
     dataset_path = os.path.join(run_dir, "dataset.npz")
@@ -98,6 +111,8 @@ def main(argv=None):
         dataset_summary_path=os.path.join(run_dir, "dataset_summary.json"),
         holdout_checkpoints=summary["holdout_checkpoints"],
         collected_checkpoints=summary["collected_checkpoints"],
+        references=summary.get("references"),
+        references_dir=os.path.join(run_dir, "references"),
         failure_sources=summary["failure_sources"], split=summary["split"],
         total_episodes=summary["total_episodes"],
         duplicate_fraction=summary["duplicate_fraction"],

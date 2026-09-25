@@ -323,7 +323,7 @@ def format_preview_table(preview):
     return "\n".join(lines)
 
 
-def check_preview(preview, reward_mode, guard_pred_max=None):
+def check_preview(preview, reward_mode, guard_pred_max=None, time_penalty=None):
     """
     Turn the preview into a pass/fail verdict per combo for one reward mode.
     Returns {combo: dict(ok=bool, reasons=[...])}.
@@ -360,7 +360,11 @@ def check_preview(preview, reward_mode, guard_pred_max=None):
                 f"(mean {gap:.0f} ± {entry.get('return_gap_std', 0):.0f})")
         observed = entry.get("pred_max")
         hov = entry.get("hover_reward")          # at the OBSERVED maximum
-        hov_guard = (float(hover_reward(guard, reward_mode=reward_mode,
+        # the guard must use the SAME time penalty training will use, or a run
+        # with --time-penalty 0 passes a gate evaluated at the default 1.0 and
+        # then trains on a reward that pays for hovering
+        _tp = {} if time_penalty is None else {"time_penalty": time_penalty}
+        hov_guard = (float(hover_reward(guard, reward_mode=reward_mode, **_tp,
                                         gamma=entry.get("gamma", 1.0)))
                      if reward_mode in SHAPED_MODES else None)
         if hov_guard is not None and hov_guard >= 0:

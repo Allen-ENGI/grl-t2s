@@ -74,21 +74,51 @@ CONFIRM_BUFFER = 20          # frames recorded after success
 WINDOW = 10                  # sliding window for the sustained-dead-signal metrics
 HIGHER_IS_BETTER = ("pooled_spearman", "monotonicity_rho")
 CORRELATIONS = ("pooled_pearson", "pooled_spearman", "monotonicity_rho")
-REPORT_METRICS = ("mae", "bias", "calibration_slope", "step_slope_error",
-                  "worst_window_slope_error", "dead_window_fraction",
-                  "max_wrong_direction")
-# the two correlation columns are omitted by default: on the observed runs they
-# read ~1.00 for every model (see the module docstring) and separated nothing.
-# Pass metrics=REPORT_METRICS + CORRELATIONS to bring them back.
+# FOUR metrics by default, one per question the reward has to answer:
+#   mae                    does it predict TIME correctly (success rollouts)
+#   step_slope_error       is the per-step DECREMENT right — the quantity the
+#                          shaped reward literally consumes
+#   dead_window_fraction   is there any gradient at all, or sustained flat runs
+#   fail_pred_min          does it stay pessimistic on a trajectory that never
+#                          succeeds — the false-optimism defect
+#
+# Dropped from the default, with reasons:
+#   fail_optimism      = CENSOR_LABEL - fail_pred_min exactly. A mirrored
+#                        duplicate; two panels carried one fact.
+#   calibration_slope  a wrong scale IS a wrong per-step decrement, which
+#                      step_slope_error already measures in the units the
+#                      reward uses.
+#   bias               a constant offset nearly CANCELS in difference shaping
+#                      (it survives only as c*(1-gamma) per step), so it is the
+#                      least reward-relevant of the error terms.
+#   worst_window_*     keeps the same information as dead_window_fraction in a
+#                      less interpretable unit.
+#   the correlations   read ~1.00 for every model on the observed runs.
+# All remain available: metrics=REPORT_METRICS + EXTRA_METRICS.
+REPORT_METRICS = ("mae", "bias", "fail_pred_min")
+# REPORT_METRICS = ("mae", "bias", "decrement_mean", "decrement_std", "fail_pred_min")
+EXTRA_METRICS = ("calibration_slope", "step_slope_error", "dead_window_fraction",
+                 "worst_window_slope_error", "fail_pred_spread", "fail_optimism",
+                 "max_wrong_direction")
 
 
 # ---- held-out bookkeeping ----------------------------------------------
 
-def assert_policies_held_out(dataset_summary_path, policy_paths, strict=True):
+def assert_policies_held_out(dataset_summary_path, policy_paths, strict=False):
     """
-    Verify every policy about to be evaluated was RESERVED during collection,
-    not collected from. Stage 4's whole claim rests on this, and it used to
-    rest on memory. Raises on overlap when strict.
+    Report whether the evaluation policies were collected from.
+
+    strict now defaults to FALSE, and the claim it supports has been weakened
+    deliberately. Holding out whole checkpoints cost every one of their failure
+    modes — failure modes are checkpoint-specific, a 100k policy fails
+    differently from a 500k one — in exchange for a generalisation claim that
+    did not probe the regime that matters: neither held-out expert resembles an
+    untrained SAC policy, and the states that actually broke the models belong
+    to neither. Episode-level holdout (assign_splits, stratified per source)
+    gives validation power from EVERY checkpoint instead.
+
+    So the honest framing is held-out EPISODES, not held-out POLICIES. Pass
+    strict=True to restore the old behaviour if a run does reserve checkpoints.
     """
     import json
 
@@ -100,6 +130,9 @@ def assert_policies_held_out(dataset_summary_path, policy_paths, strict=True):
 
     leaked = [n for n in names if n in collected]
     unreserved = [n for n in names if n not in holdout]
+    if leaked and not strict:
+        print(f"  note: evaluation policies {leaked} were also collected from. "
+              "Stage 3 measures held-out EPISODES, not held-out policies.")
     if strict and leaked:
         raise AssertionError(
             f"evaluation policies {leaked} WERE collected from (sources: {sorted(collected)}). "
@@ -155,6 +188,7 @@ def compute_metrics(preds, truths, success_step=None, window=WINDOW):
     if not len(p):
         out.update({k: None for k in ("mae", "rmse", "bias", "calibration_slope",
                                       "monotonicity_rho", "step_slope_error",
+                                      "decrement_mean", "decrement_std",
                                       "max_wrong_direction", "worst_window_slope_error",
                                       "dead_window_fraction", "worst_window_start")})
         return out
@@ -170,11 +204,23 @@ def compute_metrics(preds, truths, success_step=None, window=WINDOW):
     if len(p) >= 2:
         d = -np.diff(p)                                     # predicted decrement
         err = np.abs(d - 1.0)
+        # step_slope_error = mean|d - 1| CONFLATES two different faults, and for
+        # an unbiased model it is mostly a noise measure: mean|d-1| ~= 1.13*sigma.
+        # A perfectly calibrated model with 0.9 of per-step jitter scores 1.00 —
+        # identical to a FLAT prediction, which is the opposite failure. Split it:
+        #   decrement_mean  systematic. 1.0 correct, <1 compressed, 0 flat.
+        #                   The reward is decrement - c, so this IS the reward's
+        #                   mean, shifted.
+        #   decrement_std   noise. Differencing amplifies prediction jitter, and
+        #                   this is the noise the policy receives per step.
+        out["decrement_mean"] = float(np.mean(d))
+        out["decrement_std"] = float(np.std(d))
         out["step_slope_error"] = float(np.mean(err))
         out["max_wrong_direction"] = float(max(np.max(-d), 0.0))
         out.update(window_metrics(err, window=window))
     else:
         out["step_slope_error"] = None
+        out["decrement_mean"] = out["decrement_std"] = None
         out["max_wrong_direction"] = 0.0
         out.update(worst_window_slope_error=None, dead_window_fraction=None,
                    worst_window_start=None)
@@ -323,6 +369,10 @@ def run_full_evaluation(predict_fn, success_policy, failure_policy, n_seeds=8,
         report["failure_scenario"].append(dict(
             seed=seed, succeeded_unexpectedly=ss is not None,
             pred_min=float(preds.min()), pred_max=float(preds.max()),
+            # how much the prediction MOVES on a failing rollout. A model
+            # pinned at the clip ceiling scores a perfect fail_pred_min while
+            # giving no gradient at all, so the two must be read together.
+            pred_spread=float(preds.max() - preds.min()),
             # how far below the censor level it drifts on a trajectory that
             # never succeeds: the false-optimism magnitude
             optimism_vs_censor=float(CENSOR_LABEL - preds.min()),
@@ -332,7 +382,8 @@ def run_full_evaluation(predict_fn, success_policy, failure_policy, n_seeds=8,
     rows = report["success_scenario"]
     if rows:
         keys = ("mae", "rmse", "mae_with_tail", "bias", "calibration_slope",
-                "monotonicity_rho", "step_slope_error", "worst_window_slope_error",
+                "monotonicity_rho", "step_slope_error", "decrement_mean",
+                "decrement_std", "worst_window_slope_error",
                 "dead_window_fraction", "worst_window_start",
                 "max_wrong_direction", "pred_max")
         report["summary"] = {k: _mean([r.get(k) for r in rows], k) for k in keys}
@@ -343,6 +394,24 @@ def run_full_evaluation(predict_fn, success_policy, failure_policy, n_seeds=8,
         unexpected_success_rate=float(np.mean([r["succeeded_unexpectedly"] for r in fails]))
         if fails else None,
         mean_pred_min=float(np.mean([r["pred_min"] for r in fails])) if fails else None)
+    # Promote the failure numbers into `summary` under a fail_ prefix so the
+    # table and the chart can reach them. They were computed, stored, and then
+    # never displayed — which is why a model could look fine on every plotted
+    # panel while predicting "25 steps to success" throughout a trajectory that
+    # never succeeds. The success rollouts come from an expert that goes
+    # straight to the goal, so hovering NEVER OCCURS in them and no
+    # success-scenario metric can see it.
+    if fails:
+        report.setdefault("summary", {}).update(
+            # lowest prediction reached on a trajectory that never succeeds.
+            # LOWER IS WORSE: it is the model's most confident false claim.
+            fail_pred_min=float(np.mean([r["pred_min"] for r in fails])),
+            fail_pred_spread=float(np.mean([r.get("pred_spread", 0.0) for r in fails])),
+            # same thing as a distance below the censor level
+            fail_optimism=float(np.mean([r["optimism_vs_censor"] for r in fails])),
+            fail_pred_mean=float(np.mean([(r["pred_min"] + r["pred_max"]) / 2
+                                          for r in fails])),
+        )
     return report
 
 
@@ -357,8 +426,19 @@ def evaluate_on_val_split(predict_fn, dataset_path, max_rows=50_000, seed=0):
         raise KeyError(f"{dataset_path} has no 'split' array — re-collect with the "
                        "current data_collection.")
     X, y, split = d["X"], d["y_steps"], d["split"].astype(str)
-    # rows from failed episodes carry the censored ceiling, not a true label
-    idx = np.flatnonzero((split == "val") & (y != CENSOR_LABEL))
+    # Two exclusions, not one:
+    #   y == CENSOR_LABEL  failed-episode rows carry the ceiling, not a label
+    #   y == 0             the POST-SUCCESS TAIL. dataset.npz is untrimmed, so
+    #                      ~89% of every successful episode is a peg already in
+    #                      the hole. Keeping those rows made val MAE a measure
+    #                      of "does it decay to zero when finished" rather than
+    #                      "can it count down", and it dominated the number:
+    #                      val bias came out nearly equal to val MAE, i.e. all
+    #                      errors positive, which is over-prediction on y=0
+    #                      rows. It also made val MAE incomparable with the
+    #                      rollout MAE, which is pre-success only — 15.38 vs
+    #                      1.21 for the same model.
+    idx = np.flatnonzero((split == "val") & (y != CENSOR_LABEL) & (y > 0))
     if not len(idx):
         return dict(n=0, note="val split empty after filtering")
     if len(idx) > max_rows:
@@ -367,7 +447,8 @@ def evaluate_on_val_split(predict_fn, dataset_path, max_rows=50_000, seed=0):
     preds = np.array([predict_fn(o) for o in X[idx]], dtype=float)
     truths = y[idx].astype(float)
     err = preds - truths
-    return dict(n=int(len(idx)), mae=float(np.mean(np.abs(err))),
+    return dict(n=int(len(idx)), note="pre-success rows only (0 < y < censor)",
+                mae=float(np.mean(np.abs(err))),
                 bias=float(np.mean(err)),
                 calibration_slope=float(np.polyfit(truths, preds, 1)[0])
                 if np.std(truths) > 0 else None,
@@ -375,11 +456,155 @@ def evaluate_on_val_split(predict_fn, dataset_path, max_rows=50_000, seed=0):
                 pooled_spearman=_corr(spearmanr, preds, truths))
 
 
+def evaluate_on_val_episodes(predict_fn, dataset_path, max_episodes=None, seed=0):
+    """
+    The same report as run_full_evaluation, but scored on the held-out val
+    EPISODES in dataset.npz instead of eight fresh rollouts.
+
+    WHY THIS IS USUALLY THE BETTER NUMBER
+    -------------------------------------
+    `split` is assigned per EPISODE at collection time, so val rows form whole
+    trajectories in frame order: every metric here is computable, temporal ones
+    included. Against that, the live path rolls exactly n_seeds trajectories.
+    Thousands of frames across dozens of episodes is a far larger sample, needs
+    no simulator, and takes seconds.
+
+    The live rollouts were justified when Stage 1 RESERVED checkpoints: they
+    then came from policies absent from training, which the val split could not
+    provide. That holdout was dropped, so the reference policies were collected
+    from too — and the live rollouts are no longer a different distribution,
+    just a smaller one.
+
+    What neither covers is the regime that actually matters: both are expert
+    generated, and the states an untrained RL policy visits appear in neither.
+    That is what manual_drive and the perturbed references are for.
+
+    Returns the same {"success_scenario", "failure_scenario", "summary"} shape,
+    so format_report_table and plot_combo_comparison work unchanged.
+    """
+    d = np.load(dataset_path)
+    for k in ("split", "episode_ids", "frame_idxs"):
+        if k not in d.files:
+            raise KeyError(f"{dataset_path} has no {k!r} — re-collect with the "
+                           "current data_collection.")
+    X, y = d["X"], d["y_steps"]
+    ep, fr, split = d["episode_ids"], d["frame_idxs"], d["split"].astype(str)
+
+    val = np.flatnonzero(split == "val")
+    eps = np.unique(ep[val])
+    if max_episodes and len(eps) > max_episodes:
+        eps = np.sort(np.random.default_rng(seed).choice(eps, max_episodes,
+                                                         replace=False))
+
+    report = {"success_scenario": [], "failure_scenario": []}
+    pairs = []
+    for e in eps:
+        idx = np.flatnonzero(ep == e)
+        idx = idx[np.argsort(fr[idx])]              # frame order, not file order
+        ye = y[idx].astype(float)
+        preds = np.array([predict_fn(o) for o in X[idx]], dtype=float)
+
+        if np.all(ye == CENSOR_LABEL):              # never succeeded
+            report["failure_scenario"].append(dict(
+                seed=int(e), succeeded_unexpectedly=False,
+                pred_min=float(preds.min()), pred_max=float(preds.max()),
+                pred_spread=float(preds.max() - preds.min()),
+                optimism_vs_censor=float(CENSOR_LABEL - preds.min()),
+                max_wrong_direction=max_wrong_direction(preds)))
+            continue
+
+        zero = np.flatnonzero(ye == 0.0)
+        ss = int(zero[0]) if len(zero) else None
+        if ss is None or ss < 2:
+            continue                                # no countdown to score
+        m = compute_metrics(preds, ye, success_step=ss)
+        m.update(seed=int(e), success_step=ss)
+        report["success_scenario"].append(m)
+        pairs.append((preds, ye, ss))
+
+    report["pooled_ranking"] = pooled_ranking_metrics(pairs)
+    rows = report["success_scenario"]
+    if rows:
+        keys = ("mae", "rmse", "mae_with_tail", "bias", "calibration_slope",
+                "monotonicity_rho", "step_slope_error", "decrement_mean",
+                "decrement_std", "worst_window_slope_error",
+                "dead_window_fraction", "worst_window_start",
+                "max_wrong_direction", "pred_max")
+        report["summary"] = {k: _mean([r.get(k) for r in rows], k) for k in keys}
+        report["summary"].update({k: report["pooled_ranking"][k]
+                                  for k in ("pooled_pearson", "pooled_spearman")})
+    fails = report["failure_scenario"]
+    if fails:
+        report.setdefault("summary", {}).update(
+            fail_pred_min=float(np.mean([r["pred_min"] for r in fails])),
+            fail_pred_spread=float(np.mean([r.get("pred_spread", 0.0) for r in fails])),
+            fail_optimism=float(np.mean([r["optimism_vs_censor"] for r in fails])),
+            fail_pred_mean=float(np.mean([(r["pred_min"] + r["pred_max"]) / 2
+                                          for r in fails])))
+    report["n_episodes"] = dict(success=len(rows), failure=len(fails))
+    return report
+
+
+def load_references(data_run_dir, kinds=None):
+    """
+    Reference trajectories stored by data_collection.collect_references.
+
+    Returns {"success": [traj, ...], "failure": [traj, ...]} in the shape
+    reward_preview and the video tools already expect, so they need no change.
+    The perturbed variants are folded in alongside the clean ones: a perturbed
+    recovery IS a success trajectory, just one that starts somewhere an expert
+    would never be, which is the regime the clean references cannot reach.
+
+    Each traj carries "obs", "success_step", "truth", "seed", "kind", and
+    "video" (a path, or None). Frames are NOT loaded — decode the mp4 only in
+    the tools that draw pixels.
+    """
+    import json
+
+    ref_dir = os.path.join(data_run_dir, "references")
+    idx_path = os.path.join(ref_dir, "index.json")
+    if not os.path.exists(idx_path):
+        raise FileNotFoundError(
+            f"no references in {ref_dir}. Re-collect with the current "
+            "data_collection (references=True), or call "
+            "collect_eval_trajectories to roll them live.")
+    with open(idx_path) as f:
+        index = json.load(f)
+
+    out = {"success": [], "failure": []}
+    for row in index["trajectories"]:
+        if kinds and row["kind"] not in kinds:
+            continue
+        d = np.load(os.path.join(ref_dir, row["name"] + ".npz"))
+        ss = int(d["success_step"][0])
+        ss = None if ss < 0 else ss
+        mp4 = os.path.join(ref_dir, row["name"] + ".mp4")
+        traj = dict(obs=d["obs"], success_step=ss, seed=row["seed"],
+                    kind=row["kind"], frames=None,
+                    video=mp4 if row.get("video") and os.path.exists(mp4) else None,
+                    truth=(d["y_steps"] if ss is not None else None))
+        out["success" if ss is not None else "failure"].append(traj)
+    return out
+
+
+def load_frames(traj):
+    """Decode a reference trajectory's stored mp4 into frames, on demand."""
+    import imageio.v3 as iio
+
+    if not traj.get("video"):
+        return None
+    return list(iio.imiter(traj["video"]))
+
+
 def collect_eval_trajectories(success_policy, failure_policy, seeds=(500, 501, 502),
                               max_steps=500, record_frames=False):
     """
     Reference rollouts from the held-out policies, for reward_preview and
     t2s_video. Returns {"success": [traj, ...], "failure": [traj, ...]}.
+
+    PREFER load_references() when the data run has them: stored trajectories
+    mean every tool scores identical states, and these eval seeds fall inside
+    collection's own seed block anyway. This remains for runs without them.
 
     SEVERAL seeds, not one. This used to roll out exactly two trajectories
     with a deterministic policy, and reward_preview computed its go/no-go
@@ -399,8 +624,67 @@ def collect_eval_trajectories(success_policy, failure_policy, seeds=(500, 501, 5
 
 # ---- reporting -----------------------------------------------------------
 
+# A model must stay at least this pessimistic on a trajectory that never
+# succeeds before its MAE is worth ranking. The best-MAE model on the observed
+# run scored fail_pred_min 4.11 — it claims four steps to success on a rollout
+# that never succeeds — so ranking by MAE alone selects the reward most likely
+# to pay for hovering. Stage 4 applies the same threshold; it lives here so the
+# two stages cannot recommend different models.
+MIN_FAIL_PRED = 30.0
+
+FAIL_METRICS = ("fail_pred_min", "fail_pred_spread", "fail_optimism", "fail_pred_mean")
+# Held-out EPISODES from dataset.npz (split == "val"): thousands of collected
+# states the model never trained on. evaluate_on_val_split has always computed
+# these and nothing ever displayed them, so the report looked as though it
+# scored only the eight live rollouts. Thousands of rows is the larger sample;
+# the rollouts are the more realistic one. Read both.
+VAL_METRICS = ("val_mae", "val_bias", "val_calibration_slope", "val_n")
+# fail_pred_min: LOWER is worse (a confident false claim of imminent success).
+# fail_optimism: HIGHER is worse (further below the censor level).
+
+
+def rank_models(reports, n=2, min_fail_pred=MIN_FAIL_PRED):
+    """
+    The models worth training against: reject false optimism FIRST, then rank
+    the survivors by MAE. Returns (chosen, rejected, reason).
+
+    MAE alone is the wrong order. It is measured only on success rollouts,
+    where models trained on success data specialise, and it correlated +0.68
+    with fail_pred_min across the observed grid — better success accuracy went
+    with worse failure behaviour.
+    """
+    def m(c, k):
+        v = metric_mean_std(reports[c], k)[0]
+        return None if v is None else float(v)
+
+    ok = [c for c in reports
+          if (m(c, "fail_pred_min") or 0.0) >= min_fail_pred]
+    rejected = [c for c in reports if c not in ok]
+    reason = (f"{len(ok)} of {len(reports)} pass fail_pred_min >= {min_fail_pred}"
+              if ok else
+              f"NO model passes fail_pred_min >= {min_fail_pred}; ranking all by MAE")
+    pool = ok or list(reports)
+    chosen = sorted(pool, key=lambda c: m(c, "mae")
+                    if m(c, "mae") is not None else float("inf"))[:n]
+    return chosen, rejected, reason
+
+
 def metric_mean_std(report, metric):
     """(mean, std) across per-seed rollouts. Pooled metrics have no spread."""
+    if metric == "decrement_mean":
+        # best is 1.0, like calibration_slope
+        pass
+    if metric in VAL_METRICS:
+        v = report.get("val_split") or {}
+        return (v.get(metric[len("val_"):] if metric != "val_n" else "n"), None)
+    if metric in FAIL_METRICS:
+        rows = report.get("failure_scenario", [])
+        key = {"fail_pred_min": "pred_min", "fail_pred_spread": "pred_spread",
+               "fail_optimism": "optimism_vs_censor"}.get(metric)
+        vals = [r[key] for r in rows if key and r.get(key) is not None]
+        if vals:
+            return (float(np.mean(vals)), float(np.std(vals)))
+        return (report.get("summary", {}).get(metric), None)
     if metric.startswith("pooled_"):
         return (report.get("pooled_ranking", {}).get(metric)
                 or report.get("summary", {}).get(metric), None)
@@ -415,25 +699,53 @@ def _ordered(reports, sort_by):
     names = list(reports)
     if not sort_by:
         return names
-    higher = sort_by in HIGHER_IS_BETTER or sort_by == "calibration_slope"
+    unit_best = sort_by in ("calibration_slope", "decrement_mean")
+    higher = sort_by in HIGHER_IS_BETTER or unit_best
 
     def key(c):
         m = metric_mean_std(reports[c], sort_by)[0]
         if m is None:
             return float("-inf") if higher else float("inf")
-        return -abs(m - 1.0) if sort_by == "calibration_slope" else m    # best is 1.0
+        return -abs(m - 1.0) if unit_best else m    # best is 1.0
     return sorted(names, key=key, reverse=higher)
 
 
 LEGEND = """
-mae/bias          : pre-success frames only (mae_with_tail keeps the confirm buffer)
-bias              : signed; NEGATIVE = claims success is nearer than it is
-calibration_slope : 1.0 is correct; no correlation can see a wrong scale
-step_slope_error  : mean |predicted decrement - 1|; what the shaped reward consumes
-pooled_spearman   : ACROSS trajectories — sees level drift between rollouts
-monotonicity_rho  : WITHIN trajectory vs frame index; ~0.99 for any decreasing curve
-worst_window_slope: worst 10-step stretch; >=1.0 means a SUSTAINED dead region
-dead_window_frac  : share of windows with no usable gradient (want 0.00)"""
+mae                  pre-success frames of SUCCESS rollouts: does it predict
+                     time correctly. NOT a selector on its own — it is measured
+                     only where success-trained models specialise, and it
+                     correlated +0.68 with fail_pred_min across the grid.
+bias                 signed mean error. NEGATIVE = claims success is nearer
+                     than it is. Note it barely reaches the reward: a constant
+                     offset CANCELS in difference shaping, leaving only
+                     c*(1-gamma) per step. Read it with mae — |bias|/mae near 1
+                     means a harmless offset, near 0 means a shape error.
+decrement_mean       mean predicted drop per step. 1.0 correct, <1 compressed,
+                     0 flat. The reward IS decrement - c, so this is the
+                     reward's mean, shifted.
+decrement_std        noise in that drop, i.e. the per-step noise the policy
+                     receives. Differencing amplifies prediction jitter.
+                     These two replace step_slope_error = mean|d-1|, which
+                     conflated them: a calibrated model with 0.9 of jitter and
+                     a FLAT prediction both score exactly 1.00.
+fail_pred_spread     how far the prediction MOVES on a failing rollout. Read
+                     WITH fail_pred_min: a model pinned at the clip ceiling
+                     scores a perfect fail_pred_min and gives no gradient at
+                     all. mcboot_all sat at 300 for 500 steps.
+fail_pred_min        lowest prediction on a trajectory that NEVER succeeds.
+                     LOW IS BAD: the model's most confident false claim, and
+                     the single best predictor of a reward that pays for
+                     hovering. Reject below 30 before ranking by MAE.
+
+val_mae / val_bias   the SAME questions asked on held-out EPISODES from
+                     dataset.npz rather than on live rollouts: thousands of
+                     collected states the model never trained on, against
+                     eight rollouts. Add with metrics=REPORT_METRICS +
+                     VAL_METRICS.
+
+also available via metrics=REPORT_METRICS + EXTRA_METRICS:
+bias, calibration_slope, worst_window_slope_error, fail_optimism,
+max_wrong_direction, and the correlations."""
 
 
 def format_report_table(reports, metrics=REPORT_METRICS, sort_by="mae", show_std=True):
@@ -446,8 +758,11 @@ def format_report_table(reports, metrics=REPORT_METRICS, sort_by="mae", show_std
     if not cols:
         return "(no metrics available)"
 
-    w = 18 if show_std else 14
-    header = f"{'combo':<20}" + "".join(f"{m[:w]:>{w}}" for m in cols)
+    # column width follows the LONGEST name present, so nothing is truncated:
+    # "worst_window_slope_error" was cut to "worst_window_slope" at w=18, and
+    # "dead_window_fraction" to "dead_window_fracti".
+    w = max(18 if show_std else 14, max(len(m) for m in cols) + 2)
+    header = f"{'combo':<20}" + "".join(f"{m:>{w}}" for m in cols)
     lines = [header, "-" * len(header)]
     for c in names:
         row = f"{c:<20}"
@@ -501,8 +816,11 @@ def plot_combo_comparison(reports, metrics=REPORT_METRICS, save_path=None,
         bars = ax.bar(range(len(names)), values, yerr=errs, capsize=3, color="tab:blue",
                       error_kw=dict(ecolor="0.3", lw=1))
 
-        per_seed = {c: [r[metric] for r in reports[c].get("success_scenario", [])
-                        if r.get(metric) is not None] for c in names}
+        scen = "failure_scenario" if metric in FAIL_METRICS else "success_scenario"
+        key = {"fail_pred_min": "pred_min", "fail_pred_spread": "pred_spread",
+               "fail_optimism": "optimism_vs_censor"}.get(metric, metric)
+        per_seed = {c: [r[key] for r in reports[c].get(scen, [])
+                        if r.get(key) is not None] for c in names}
         for xi, c in enumerate(names):
             if per_seed[c]:
                 ax.scatter([xi] * len(per_seed[c]), per_seed[c], s=12, color="black",
@@ -510,8 +828,16 @@ def plot_combo_comparison(reports, metrics=REPORT_METRICS, save_path=None,
 
         finite = [v for v in values if not np.isnan(v)]
         if finite:
-            best = (min(finite, key=lambda v: abs(v - 1.0)) if metric == "calibration_slope"
-                    else max(finite) if metric in HIGHER_IS_BETTER else min(finite))
+            best = (min(finite, key=lambda v: abs(v - 1.0))
+                    if metric in ("calibration_slope", "decrement_mean")
+                    # bias is SIGNED and best at 0. Taking the minimum marked the
+                    # most negative value green — tdlambda_all at -17.60 was
+                    # highlighted as best when it is the worst in the panel.
+                    else min(finite, key=abs) if metric == "bias"
+                    # fail_pred_min: a HIGH minimum is good — the model stayed
+                    # pessimistic on a trajectory that never succeeded
+                    else max(finite) if metric in HIGHER_IS_BETTER + ("fail_pred_min",)
+                    else min(finite))
             # a metric where every combo ties has no winner; colouring them all
             # green implies a distinction the numbers do not support
             if sum(v == best for v in values) < len(finite):
@@ -535,14 +861,24 @@ def plot_combo_comparison(reports, metrics=REPORT_METRICS, save_path=None,
                 ax.text(xi, bot - pad, f"n={n_seeds}", ha="center", va="top",
                         fontsize=6.5, color="0.45")
 
-        if metric == "calibration_slope":
+        if metric in ("calibration_slope", "decrement_mean"):
             ax.axhline(1.0, color="tab:red", ls="--", lw=1, label="correct = 1.0")
+            if metric == "decrement_mean":
+                ax.axhline(0.0, color="0.4", ls=":", lw=1, label="flat = 0.0")
             ax.legend(fontsize=7)
         if metric in ("step_slope_error", "worst_window_slope_error"):
             # a perfectly FLAT prediction gives |0 - 1| = 1.0 exactly, so this
             # line is the dead-signal threshold: at or above it the prediction
             # carries no usable per-step gradient
             ax.axhline(1.0, color="tab:red", ls="--", lw=1, label="flat = 1.0 (dead)")
+            # green marks the best of the set, which is misleading when the
+            # best is itself at the failure threshold — every model having a
+            # fully dead window is not a distinction worth colouring
+            if finite and min(finite) >= 1.0:
+                for bar in bars:
+                    bar.set_color("tab:red")
+                ax.set_title(metric + "  — EVERY model has a dead window",
+                             fontsize=9, color="tab:red")
             ax.legend(fontsize=7)
         ax.set_title(metric, fontsize=10)
         ax.set_xticks(range(len(names)))
@@ -563,12 +899,18 @@ def plot_combo_comparison(reports, metrics=REPORT_METRICS, save_path=None,
 
 
 def evaluate_runs(t2s_run_dir, summary_rows, success_policy, failure_policy,
-                  n_seeds=8, dataset_path=None, verbose=True):
+                  n_seeds=8, dataset_path=None, verbose=True, score_on="rollouts"):
     """
     Evaluate every combo in one t2s_model run. Returns {combo: report}.
 
-    dataset_path also runs the held-out-ROWS evaluation and attaches it as
-    report["val_split"] — worth doing, since 8 rollouts is thin.
+    score_on="val" scores the held-out val EPISODES instead of live rollouts:
+    dozens of complete trajectories against eight, no simulator, seconds
+    instead of minutes. See evaluate_on_val_episodes for why that is now the
+    better-justified default sample.
+
+    Either way, dataset_path attaches the per-row val evaluation as
+    report["val_split"], and score_on="val" also attaches the live report as
+    report["rollouts"] only if policies are supplied.
     """
     import t2s_predict
 
@@ -579,7 +921,13 @@ def evaluate_runs(t2s_run_dir, summary_rows, success_policy, failure_policy,
             print(f"  evaluating {row['combo']} ...", flush=True)
         fn = t2s_predict.load_t2s_predictor(t2s_run_dir, method, condition,
                                             seed=row["best_seed"])
-        rep = run_full_evaluation(fn, success_policy, failure_policy, n_seeds=n_seeds)
+        if score_on == "val":
+            if not dataset_path:
+                raise ValueError("score_on='val' needs dataset_path")
+            rep = evaluate_on_val_episodes(fn, dataset_path)
+        else:
+            rep = run_full_evaluation(fn, success_policy, failure_policy,
+                                      n_seeds=n_seeds)
         if dataset_path:
             rep["val_split"] = evaluate_on_val_split(fn, dataset_path)
         reports[row["combo"]] = rep

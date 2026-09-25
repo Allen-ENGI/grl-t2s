@@ -71,12 +71,18 @@ class SuccessRateCallback(BaseCallback):
         """
         from progress import compute_progress_metrics
 
+        import torch
+
+        # Seeding torch for a reproducible eval used to LEAVE the global RNG
+        # reseeded, so every eval silently reset SAC's exploration stream and
+        # changed the training run it was supposed to be observing. Save and
+        # restore around the episode.
+        rng_state = torch.get_rng_state()
         obs, _ = self.eval_env.reset(seed=seed)
         if not self.eval_deterministic:
             # the policy's own sampling is the only source of episode-to-episode
             # variation on a pinned scene, so seed it explicitly to keep the
             # eval reproducible across runs while still varying within a run
-            import torch
             torch.manual_seed(seed)
         obs_list, success_step = [], None
         preds, rewards = [], []
@@ -96,6 +102,7 @@ class SuccessRateCallback(BaseCallback):
                 success_step = t + 1        # the state AFTER this step is the successful one
             if terminated or truncated:
                 break
+        torch.set_rng_state(rng_state)      # training continues undisturbed
         # record the final state so index success_step always exists
         obs_list.append(np.asarray(obs, dtype=np.float32).copy())
         m = compute_progress_metrics(np.array(obs_list), success_step)
@@ -180,6 +187,7 @@ class SuccessRateCallback(BaseCallback):
 def train_sac(train_env, eval_env, run_dir, total_timesteps, ckpt_prefix="policy",
               eval_freq=10_000, ckpt_freq=100_000, n_eval_episodes=10,
               smoke_test_steps=5_000, seed=0, sac_kwargs=None, tb_subdir="tb",
+              smoke_counts_toward_total=True,
               gamma=RL_GAMMA, n_eval_seeds_base=10_000):
     """
     Generic SAC training loop: smoke test, then full run, saving into run_dir.
@@ -221,7 +229,12 @@ def train_sac(train_env, eval_env, run_dir, total_timesteps, ckpt_prefix="policy
                                   n_eval_episodes=n_eval_episodes, ckpt_freq=ckpt_freq,
                                   ckpt_prefix=ckpt_prefix, eval_seed_base=n_eval_seeds_base,
                                   verbose=1)
-    model.learn(total_timesteps=total_timesteps, callback=main_cb,
+    # reset_num_timesteps=False continues the counter, so a 3k smoke test plus
+    # a 400k main run reported 403k. Subtract it so "400k" means 400k and two
+    # runs with different smoke settings stay comparable.
+    main_steps = (max(total_timesteps - (smoke_test_steps or 0), 1)
+                  if smoke_counts_toward_total else total_timesteps)
+    model.learn(total_timesteps=main_steps, callback=main_cb,
                 tb_log_name="train", reset_num_timesteps=False)
 
     model.save(os.path.join(run_dir, f"{ckpt_prefix}_final"))
