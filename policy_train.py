@@ -12,17 +12,19 @@ independent defaults.
 """
 import json
 import os
-
+import numpy as np
+from collections import defaultdict
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
 
 from config import RL_GAMMA, RL_SEEDS, TIME_PENALTY
 from policy_env import make_policy_train_env
 from reward_fn import assert_shaping_gamma_safe
 from rl_common import train_sac
+from t2s_model import load_t2s_predictor
 
 
-def train_policy(run_dir, predict_t2s, reward_mode="difference_timed", total_timesteps=400_000,
-                 n_envs=6, eval_freq=10_000, ckpt_freq=50_000, n_eval_episodes=5,
+def train_policy(run_dir, predict_t2s, reward_mode="difference", total_timesteps=400_000,
+                 n_envs=4, eval_freq=10_000, ckpt_freq=50_000, n_eval_episodes=5,
                  seed=0, smoke_test_steps=3_000, time_penalty=TIME_PENALTY,
                  gamma=RL_GAMMA, terminate_on_success=True, norm_reward=True,
                  pred_max_for_gamma_check=None, ent_coef="auto",
@@ -67,7 +69,7 @@ def train_policy(run_dir, predict_t2s, reward_mode="difference_timed", total_tim
         # ent_coef="auto" LEARNS alpha to hit target_entropy, which SB3
         # defaults to -dim(action) = -4. Raising the target (e.g. -2) keeps the
         # policy more stochastic for longer; a fixed float pins alpha instead.
-        sac_kwargs=dict(buffer_size=300_000, ent_coef=ent_coef,
+        sac_kwargs=dict(buffer_size=1_000_000, ent_coef=ent_coef,
                         target_entropy=target_entropy),
     )
     train_env.save(os.path.join(run_dir, "vecnormalize.pkl"))
@@ -96,35 +98,7 @@ def run_sweep(model_specs, results_module, seeds=RL_SEEDS, sweep_name="sweep_v1"
               reward_mode="difference_timed", total_timesteps=400_000,
               gamma=RL_GAMMA, skip_existing=True, pred_maxes=None, force=False,
               **train_kwargs):
-    """
-    Trains one policy per (model, seed) pair.
 
-    model_specs: {label: (t2s_run_dir, combo, t2s_seed)} — exactly the dict the
-        notebook already builds when resolving MODELS. Previously this function
-        took (t2s_run_dir, combos, t2s_seeds) and had to be called once per
-        model in a loop, with sweep_name carrying the label, which produced run
-        dirs like `sweep_v5_td0_all_v2_td0_all_seed1` — the combo name twice.
-        Run dirs are now `{sweep_name}_{label}_seed{seed}`.
-
-    seeds: RL seeds, default config.RL_SEEDS = (0, 1, 2). The scene is FIXED,
-        so the seed varies SAC's initialization, exploration noise and replay
-        sampling — not the task. Three of them is what distinguishes a reward
-        that is reliably trainable from one that got lucky once; reporting
-        mean without std across them would hide exactly that.
-
-    pred_maxes: optional {label: max_prediction} from reward_preview, used for
-        the hovering-safety check on the shaping gamma.
-
-    skip_existing: a (label, seed) whose run dir already has a non-empty
-        eval_history.json is loaded from disk instead of retrained, so a crash
-        on run 7 of 9 does not cost the first six.
-
-    Returns {(label, seed): history}, ready for summarize_sweep.
-    """
-    import t2s_predict
-
-    # --force bypasses the gate in run_4_policy, but train_policy re-ran the
-    # same hovering assertion and raised anyway, so the flag did not work.
     pred_maxes = {} if force else (pred_maxes or {})
     sweep_results = {}
     total = len(model_specs) * len(seeds)
@@ -134,7 +108,7 @@ def run_sweep(model_specs, results_module, seeds=RL_SEEDS, sweep_name="sweep_v1"
         method, condition = combo.rsplit("_", 1)
         # one frozen predictor per model, reused across every RL seed so the
         # only thing varying within a model is the RL seed
-        predict_fn = t2s_predict.load_t2s_predictor(t2s_run_dir, method, condition,
+        predict_fn = load_t2s_predictor(t2s_run_dir, method, condition,
                                                     seed=t2s_seed)
         for sd in seeds:
             i += 1
@@ -176,9 +150,7 @@ def summarize_sweep(sweep_results):
     a model that reaches 0.8 on one seed and 0.1 on two others is not better
     than one that reliably reaches 0.5, and only the std reveals that.
     """
-    import numpy as np
-    from collections import defaultdict
-
+    
     by_label = defaultdict(dict)
     for (label, seed), history in sweep_results.items():
         by_label[label][seed] = history

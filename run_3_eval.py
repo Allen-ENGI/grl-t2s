@@ -45,6 +45,11 @@ import os
 import re
 import sys
 
+import config
+import results
+import t2s_eval
+from t2s_model import load_t2s_predictor
+
 STAGE_MANIFEST = "stage_manifest.json"
 
 
@@ -90,10 +95,7 @@ def pick_eval_policies(holdout):
 def main(argv=None):
     args = parse_args(argv)
 
-    import config
-    import results
-    import t2s_eval
-    import t2s_predict
+   
 
     # ---- Stage 2's handoff ----------------------------------------------
     try:
@@ -207,7 +209,7 @@ def main(argv=None):
         video_dir = os.path.join(eval_dir, "videos")
         print(f"\n=== live prediction videos -> {video_dir} ===")
         predictors = {
-            c: t2s_predict.load_t2s_predictor(t2s_dir, *c.rsplit("_", 1),
+            c: load_t2s_predictor(t2s_dir, *c.rsplit("_", 1),
                                               seed=stage2["combos"][c]["best_seed"])
             for c in combos}
         for combo, fn in predictors.items():

@@ -9,35 +9,17 @@ run_3_eval.py; splitting them means a failed or rethought evaluation costs
 minutes instead of a retrain, and the two manifests say plainly which models
 exist and which have been scored.
 
-THE GRID IS THE EXPERIMENT
---------------------------
-    methods         mc | td0 | tdlambda    the three value targets
-    conditions      succ | all             the two data sources
-    censor_schemes  censor | bootstrap     value bootstrap, or not
-    = 12 models, named "<method>[boot]_<condition>"
-
-ONE SEED, DELIBERATELY. The scene is pinned, the dataset is fixed, and the
-train/val split is fixed at collection time, so a second training seed varies
-only network initialisation and batch order. That measures optimiser noise,
-not which formulation is better, and averaging it into a `mean_val_mse ± std`
-made the seed loop look like evidence it was not. Seeds earn their keep in
-Stage 3 (rollouts genuinely differ) and in the Stage 4 RL sweep (exploration
-differs). Override with --seed if you want a different draw.
-
-TWO GAMMAS, DO NOT UNIFY
-------------------------
-config.T2S_BOOTSTRAP_GAMMA (0.99) sets the fixed point dt/(1-gamma)=100 for
-the never-succeeding recursion. NOT config.RL_GAMMA (0.999), which Stage 4
-uses for shaping. Raising this one to 0.999 puts the fixed point at 1000,
-above the prediction clip, reinstating the arbitrary ceiling the bootstrap
-scheme exists to remove.
-
-Exit codes: 0 ok, 1 Stage 1's output is missing or nothing trained.
 """
 import argparse
 import json
 import os
 import sys
+import torch
+
+import config
+import results
+import t2s_train
+
 
 STAGE_MANIFEST = "stage_manifest.json"
 
@@ -47,7 +29,7 @@ def parse_args(argv=None):
         description="Stage 2: T2S training",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--data-run", required=True, help="run name from run_1_collect.py")
-    p.add_argument("--run-name", default="v3", help="t2s_model run name")
+    p.add_argument("--run-name", default="v6", help="t2s_model run name")
     p.add_argument("--seed", type=int, default=0, help="single training seed")
     p.add_argument("--device", default=None, help="cuda|cpu (default: auto)")
     p.add_argument("--quick", action="store_true",
@@ -57,12 +39,6 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-
-    import torch
-
-    import config
-    import results
-    import t2s_train
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -117,11 +93,6 @@ def main(argv=None):
         print(f"{r['combo']:<22}{r['method']:<10}{r['condition']:<7}"
               f"{r['censor_scheme']:<11}{r['gamma']:>7.2f}"
               f"{r['val_mse']:>11.2f}{r['val_mse_succ_only']:>11.2f}")
-    print("\nval MSE    : all val rows; failed-episode rows carry a censored label,")
-    print("             so this partly scores agreement with a fiction")
-    print("succ only  : val rows from SUCCESSFUL episodes — the honest number")
-    print("These rank fit to held-out ROWS. Stage 3 evaluates held-out POLICIES,")
-    print("which is the stronger test and can rank differently.")
 
     manifest = dict(
         stage="2_train", run_name=args.run_name, run_dir=run_dir,

@@ -478,15 +478,6 @@ def render_model_comparison_video(rollout, predictors, save_path=None, fps=FPS,
 
 
 def _pad_to_macroblock(frames, block=16):
-    """
-    Pad every frame to one common size, rounded up to a multiple of `block`.
-
-    Two reasons. H.264 encoders want macroblock-aligned dimensions, and
-    imageio otherwise silently RESIZES, resampling the text in the readout
-    panel. And frames must all be identical in size or the encoder refuses
-    outright — padding to the per-batch MAXIMUM rather than to the first
-    frame's size makes that impossible to get wrong from the caller's side.
-    """
     arrs = [np.asarray(f) for f in frames]
     H = max(a.shape[0] for a in arrs)
     W = max(a.shape[1] for a in arrs)

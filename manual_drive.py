@@ -7,56 +7,18 @@ T2S prediction across both phases.
     python manual_drive.py --drive retreat --models tdlambdaboot_succ td0_all
     python manual_drive.py --drive "back:40" --policy-run sweep_v6_td0boot_all_seed0
 
-WHY THIS IS THE MOST INFORMATIVE VIDEO IN THE PIPELINE
-------------------------------------------------------
-Every other rollout in this project starts at the same pinned reset state and
-is driven by an expert or a near-expert. So every state a T2S model is ever
-scored on sits on or near the expert manifold — which is precisely the gap
-dataset_audit.check_exploration_coverage flags: if the dataset has no states
-with the hand far from the object, predictions out there are extrapolation,
-and extrapolation is what a downstream RL policy hits from step one.
-
-Driving the arm somewhere the expert never goes, then releasing a policy that
-CAN solve the task from there, produces the one trajectory that separates the
-models honestly:
-
-  - during the MANUAL phase the prediction SHOULD RISE. The arm is being taken
-    further from success, so steps-to-success genuinely increases. A model
-    whose prediction stays flat, or falls, while the arm retreats has learnt
-    "this looks like a demonstration frame" rather than "this is how far I am".
-  - at HANDOVER the prediction should sit at roughly the number of steps the
-    policy then actually takes. That is the only place in this pipeline where
-    a prediction can be checked against a real, unrehearsed outcome.
-  - during the POLICY phase it should count down at about 1 per step, which is
-    what step_slope_error measures in aggregate — here you can watch it.
-
-The video labels each phase and marks the handover frame, and the summary
-prints predicted-at-handover against actual-steps-taken per model.
-
-DRIVE SCRIPTS
--------------
-Comma-separated "move:steps" pairs, applied in order, e.g. "back:25,up:15".
-Moves are named directions in MetaWorld's 4-D action space
-[dx, dy, dz, gripper], all in [-1, 1]:
-
-    back / forward / left / right / up / down / open / close / still
-
-Presets: --drive retreat   = back:30,up:10   (pull away from the table)
-         --drive wander    = left:15,back:15,right:15,up:10
-         --drive lift      = up:25
-         --drive nudge     = back:10
-
-Nothing here is interactive: a scripted drive is reproducible, works headless
-over SSH, and can be replayed identically across models. If you want to feel
-your way to an interesting pose, run with --probe to print the resulting
-hand/peg/goal distances without rendering, then commit to a script.
 """
 import argparse
 import json
 import os
 import sys
-
 import numpy as np
+
+import config
+import results
+import t2s_video
+from t2s_model import load_t2s_predictor
+
 
 # MetaWorld action: [dx, dy, dz, gripper], each in [-1, 1]
 MOVES = {
@@ -113,7 +75,7 @@ def parse_args(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--drive", default="retreat",
                    help="'move:steps,...' or a preset: " + ", ".join(sorted(PRESETS)))
-    p.add_argument("--t2s-run", default="v3", help="t2s_model run name")
+    p.add_argument("--t2s-run", default="v6", help="t2s_model run name")
     p.add_argument("--models", nargs="+", default=None,
                    help="combo names to score (default: all in the run)")
     p.add_argument("--takeover", default="success", choices=["success", "failure"],
@@ -286,10 +248,6 @@ def render_phased(roll, predict_fn, save_path, combo, reward_mode, gamma, fps):
 def main(argv=None):
     args = parse_args(argv)
 
-    import config
-    import results
-    import t2s_predict
-    import t2s_video
 
     from stable_baselines3 import SAC
 
@@ -394,7 +352,7 @@ def main(argv=None):
     rows = {}
     predictors = {}
     for combo in combos:
-        fn = t2s_predict.load_t2s_predictor(t2s_dir, *combo.rsplit("_", 1),
+        fn = load_t2s_predictor(t2s_dir, *combo.rsplit("_", 1),
                                             seed=stage2["combos"][combo]["best_seed"])
         predictors[combo] = fn
         rows[combo] = render_phased(

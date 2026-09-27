@@ -8,54 +8,33 @@ Runs the reward preview as a GATE, then trains one SAC policy per
 (model x seed), then summarises. `--preview-only` stops after the gate, which
 costs minutes instead of hours and is the single cheapest check in the
 pipeline.
-
-THE GATE IS NOT DECORATION
---------------------------
-`difference_timed` is potential-based shaping with Phi = -pred, so the shaping
-term is pred(s) - gamma*pred(s'). On a CONSTANT prediction P — the
-post-~150-step flatline this project observed — it pays
-
-    r_hover = (1 - gamma) * P - time_penalty
-
-for a step that changes nothing. That goes POSITIVE as soon as
-(1-gamma)*P >= time_penalty, i.e. the policy is PAID TO FREEZE:
-
-    gamma=0.99,  P=200  ->  +1.00 / step
-    gamma=0.995, P=300  ->  +0.50 / step
-    gamma=0.999, P=300  ->  -0.70 / step   (correct: freezing costs)
-
-Measured with an ORACLE predictor (predictions exactly equal to ground truth),
-three success and three failure trajectories:
-
-    gamma=0.99   return_gap = -419 +/- 3    hover +1.99   FAIL
-    gamma=0.999  return_gap = +520 +/- 11   hover -0.70   PASS
-
-A perfect predictor fails the gate at 0.99. That is why config.RL_GAMMA is
-0.999 and why --gamma-sweep exists: run it on your EXISTING models before
-committing compute, because if the gap sign flips the way it did for the
-oracle, the gamma explains the sweep results rather than the T2S models doing
-so.
-
-ONE GAMMA HERE
---------------
-config.RL_GAMMA flows into SAC's critic, the shaping term inside
-Time2SuccessRewardWrapper, and VecNormalize's discounted-return statistics.
-Those were three independent defaults that could drift apart. It is NOT
-config.T2S_BOOTSTRAP_GAMMA, which Stage 2 uses for a different job.
-
-Exit codes: 0 ok, 1 the reward gate failed (see --force).
 """
 import argparse
 import json
 import os
 import sys
 
+# ---- reference trajectories -----------------------------------------
+from stable_baselines3 import SAC
+
+
+# ---- train -----------------------------------------------------------
+import policy_train
+from t2s_model import load_t2s_predictor
+import reward_preview
+
+import config
+import results
+import t2s_eval
+import t2s_video
+import visualize
+
 STAGE_MANIFEST = "stage_manifest.json"
 
 # constants, not flags: nobody chooses these per run
 PREVIEW_SEEDS = (500, 501, 502)   # reference trajectories for the reward gate
-EVAL_FREQ = CKPT_FREQ = 10_000
-N_EVAL_EPISODES = 5
+EVAL_FREQ = CKPT_FREQ = 50_000 #10_000
+N_EVAL_EPISODES = 10 #5
 
 
 def parse_args(argv=None):
@@ -71,11 +50,11 @@ def parse_args(argv=None):
     p.add_argument("--seeds", type=int, nargs="+", default=None,
                    help="RL seeds (default: config.RL_SEEDS = 0 1 2)")
     p.add_argument("--sweep-name", default="sweep_v6")
-    p.add_argument("--reward-mode", default="difference",
+    p.add_argument("--reward-mode", default="absolute",
                    choices=["absolute", "difference", "difference_timed"])
     p.add_argument("--gamma", type=float, default=None,
                    help="RL discount (default: config.RL_GAMMA)")
-    p.add_argument("--timesteps", type=int, default=400_000)
+    p.add_argument("--timesteps", type=int, default=800_000)
     p.add_argument("--no-norm-reward", dest="norm_reward", action="store_false",
                    default=True,
                    help="train on the RAW T2S reward instead of passing it through "
@@ -116,7 +95,6 @@ def parse_args(argv=None):
 
 
 def _load_predictors(t2s_run_dir, combos, manifest):
-    import t2s_predict
     specs, predictors = {}, {}
     for combo in combos:
         if combo not in manifest["combos"]:
@@ -125,7 +103,7 @@ def _load_predictors(t2s_run_dir, combos, manifest):
         best_seed = manifest["combos"][combo]["best_seed"]
         method, condition = combo.rsplit("_", 1)
         label = combo
-        predictors[label] = t2s_predict.load_t2s_predictor(
+        predictors[label] = load_t2s_predictor(
             t2s_run_dir, method, condition, seed=best_seed)
         specs[label] = (t2s_run_dir, combo, best_seed)
     return specs, predictors
@@ -134,7 +112,7 @@ def _load_predictors(t2s_run_dir, combos, manifest):
 def run_gate(trajectories, predictors, reward_mode, gamma, verbose=True,
              time_penalty=None):
     """Reward preview + pass/fail verdict. Returns (verdicts, pred_maxes)."""
-    import reward_preview
+    
 
     preview = reward_preview.preview_reward(
         trajectories, predictors, reward_modes=(reward_mode,), gamma=gamma,
@@ -149,9 +127,6 @@ def run_gate(trajectories, predictors, reward_mode, gamma, verbose=True,
 def main(argv=None):
     args = parse_args(argv)
 
-    import config
-    import results
-    import t2s_eval
 
     gamma = config.RL_GAMMA if args.gamma is None else args.gamma
     seeds = list(config.RL_SEEDS if args.seeds is None else args.seeds)
@@ -175,13 +150,6 @@ def main(argv=None):
 
     combos = args.models
     if not combos:
-        # rank by held-out-POLICY MAE, which is what Stage 3 measured; val MSE
-        # ranks held-out ROWS and can disagree
-        # MAE alone is the wrong selector: the best predictor measured on
-        # expert success rollouts was also the most falsely optimistic on
-        # failures (fail_pred_min 4.11 — it claims 4 steps to success on a
-        # trajectory that never succeeds). Filter on the reward-relevant number
-        # FIRST, then rank the survivors by MAE.
         def ev(c, k, default):
             v = stage3["combos"][c]["eval"].get(k)
             return default if v is None else v
@@ -204,14 +172,13 @@ def main(argv=None):
     print(f"    reward_mode={args.reward_mode}  RL gamma={gamma}  "
           f"reward normalisation={'VecNormalize' if args.norm_reward else 'OFF (raw)'}"
           f"  stall termination={args.stall_steps or 'off'}")
+    
     for label, (_d, combo, sd) in specs.items():
         ev = stage3["combos"][combo]["eval"]
         print(f"    {label:<28} t2s seed {sd}  mae={ev.get('mae')}  "
               f"slope={ev.get('calibration_slope')}")
 
-    # ---- reference trajectories -----------------------------------------
-    from stable_baselines3 import SAC
-
+    
     succ_pol = SAC.load(os.path.join(config.EXPERT_POLICY_DIR, stage3["success_ckpt"]))
     fail_pol = SAC.load(os.path.join(config.EXPERT_POLICY_DIR, stage3["failure_ckpt"]))
     # SEVERAL seeds per scenario: return_gap used to come from one
@@ -252,12 +219,13 @@ def main(argv=None):
     failed = []
     for label, v in verdicts.items():
         hg = v.get("hover_reward_guard")
-        print(f"  {label:<30}{'PASS' if v['ok'] else 'FAIL'}  gap={v['return_gap']:,.0f}"
-              f"  hover@observed({v['pred_max']:.0f})={v['hover_reward']:+.2f}"
-              + (f"  hover@ceiling({v['guard_pred_max']:.0f})={hg:+.2f}"
-                 if hg is not None else ""))
-        for r in v["reasons"]:
-            print(f"      - {r}")
+        fmt = lambda x, spec: "--" if x is None else format(x, spec)
+        
+        print(f"  {label:<30}{'PASS' if v['ok'] else 'FAIL'}  gap={fmt(v['return_gap'], ',.0f')}"
+        f"  hover@observed({fmt(v['pred_max'], '.0f')})={fmt(v['hover_reward'], '+.2f')}"
+        + (f"  hover@ceiling({fmt(v['guard_pred_max'], '.0f')})={fmt(hg, '+.2f')}"
+            if hg is not None else ""))
+        
         if not v["ok"]:
             failed.append(label)
 
@@ -268,8 +236,6 @@ def main(argv=None):
         print(">>> Try --gamma-sweep 0.99 0.995 0.999, or --force to train anyway.")
         return 1
 
-    # ---- train -----------------------------------------------------------
-    import policy_train
 
     print(f"\n=== training ===")
     sweep_results = policy_train.run_sweep(
@@ -306,9 +272,7 @@ def main(argv=None):
     # falls toward zero is obvious in two seconds and invisible in a table.
     videos = {}
     if args.video:
-        import t2s_video
-        import visualize
-
+        
         print("\n=== policy videos ===")
         for label, (_d, combo, _sd) in specs.items():
             for sd in seeds:

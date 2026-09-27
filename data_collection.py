@@ -13,9 +13,7 @@ before collection starts.
 import glob
 import os
 import warnings
-
 import numpy as np
-
 from config import (HAND_POS_IDX, PEG_POS_IDX, SUCCESS_KEY, MAX_STEPS,
                     CENSOR_LABEL, EXPERT_POLICY_DIR, TASK_SLUG,
                     REFERENCE_SEEDS, REFERENCE_KINDS, PERTURB_STEPS,

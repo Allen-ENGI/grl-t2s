@@ -4,7 +4,6 @@ train_res/t2s_model/
 train_res/t2s_eval/
 train_res/expertPolicy/
 train_res/
-tests/
-old/
+failed_train/
 *.md
 data/

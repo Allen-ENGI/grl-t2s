@@ -6,41 +6,6 @@ Standalone video generation — separate from the graphs on purpose.
     python make_videos.py --reward-mode absolute
     python make_videos.py --models td0boot_all mc_succ --policy-run sweep_v6_td0boot_all_seed0
 
-run_3_eval.py produces the numbers and the bar charts. This produces the
-footage. They were one script, which meant re-rendering video to try a
-different reward mode also re-ran the whole evaluation, and choosing which
-models to film meant editing an evaluation script.
-
-WHAT THE OVERLAY SHOWS
-----------------------
-  T2S predicted   the frozen model's steps-to-success for the current state
-  truth / error   ground truth where it exists (never on a failing rollout)
-  step r          what THIS transition earns under --reward-mode. Comes from
-                  reward_fn.step_reward, the same function the training
-                  wrapper calls, so it is the reward the policy was paid.
-  return          cumulative sum to this frame. The step reward says what the
-                  last action earned; the running total is what RL actually
-                  maximises, and it is what makes a long stretch of small
-                  negative rewards visibly worse than a short one.
-  hand->peg       reach phase. peg->goal cannot see reaching: an arm that
-  peg->goal       reaches but never grasps leaves the peg at its reset value.
-
-Read them together. A prediction falling toward zero while peg->goal stays
-flat at its reset distance is the false-optimism failure — the model is
-paying the policy to hover with an empty gripper.
-
-WHICH ROLLOUTS
---------------
-Expert policies by default: the held-out success and failure checkpoints
-Stage 1 reserved, read from the eval manifest so they cannot disagree with
-what collection actually held out. --policy-run instead films a TRAINED
-policy from a Stage 4 sweep, scored by the same T2S model it was trained
-against.
-
-NOTE ON PROVENANCE: these rollouts are fresh, from held-out POLICIES. They
-are not drawn from the dataset's `val` split — that split is rows, and it is
-what run_3_eval's val_split numbers use. Different, stronger test; see
-REVIEW.md.
 """
 import argparse
 import json
@@ -112,7 +77,7 @@ def main(argv=None):
     args = parse_args(argv)
 
     import config
-    import t2s_predict
+    from t2s_model import load_t2s_predictor
     import t2s_video
 
     from stable_baselines3 import SAC
@@ -144,7 +109,7 @@ def main(argv=None):
     out_dir = args.out or os.path.join(eval_dir, "videos")
     os.makedirs(out_dir, exist_ok=True)
 
-    predictors = {c: t2s_predict.load_t2s_predictor(
+    predictors = {c: load_t2s_predictor(
         t2s_dir, *c.rsplit("_", 1), seed=stage2["combos"][c]["best_seed"]) for c in combos}
 
     if args.policy_run:

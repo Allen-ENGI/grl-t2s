@@ -8,34 +8,16 @@ One copy here means a fix to eval logic never needs to be applied twice.
 import json
 import os
 import time
-
+import torch
 import numpy as np
+from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback
 
 from config import SUCCESS_KEY, RL_GAMMA
+from progress import compute_progress_metrics
 
 
 class SuccessRateCallback(BaseCallback):
-    """
-    Periodically: (a) checkpoints the model, (b) runs `n_eval_episodes` on
-    `eval_env` and records success rate + mean time-to-success against the
-    REAL success flag (not any shaped/predicted reward), appending to
-    `eval_history.json` in ckpt_dir.
-
-    `eval_env` must be a single (non-vectorized) gym.Env exposing `.reset()`
-    / `.step()` and `info["success"]`.
-
-    EVAL EPISODES ARE STOCHASTIC ON PURPOSE. This used to call
-    `eval_env.reset()` with no seed and `model.predict(deterministic=True)`.
-    The scene is pinned (make_fixed_scene_env disables task resampling) and
-    MuJoCo is deterministic, so all three sources of variation were gone:
-    every one of `n_eval_episodes` was bit-identical. success_rate could only
-    ever be 0.0 or 1.0, and every progress metric had exactly zero spread —
-    the same defect dataset_audit.check_trajectory_uniqueness caught in the
-    dataset (222 episodes -> 93 unique). n_eval_episodes=3 was paying 3x for
-    one number. Now each episode gets its own reset seed and samples the
-    policy, so the mean is an average over genuinely different rollouts.
-    """
 
     def __init__(self, eval_env, ckpt_dir, eval_freq=10_000, n_eval_episodes=10,
                  ckpt_freq=100_000, max_ep_steps=500, ckpt_prefix="policy",
@@ -48,8 +30,6 @@ class SuccessRateCallback(BaseCallback):
         self.ckpt_freq = ckpt_freq
         self.max_ep_steps = max_ep_steps
         self.ckpt_prefix = ckpt_prefix
-        # eval seeds live in a block far from any training/collection seed so
-        # they can never coincide with a trajectory the model was fit on
         self.eval_seed_base = eval_seed_base
         self.eval_deterministic = eval_deterministic
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -69,9 +49,7 @@ class SuccessRateCallback(BaseCallback):
         onset) so runs that all score 0% success can still be ranked — see
         progress.py for why cumulative shaped reward cannot serve this role.
         """
-        from progress import compute_progress_metrics
-
-        import torch
+  
 
         # Seeding torch for a reproducible eval used to LEAVE the global RNG
         # reseeded, so every eval silently reset SAC's exploration stream and
@@ -200,11 +178,12 @@ def train_sac(train_env, eval_env, run_dir, total_timesteps, ckpt_prefix="policy
     `sac_kwargs.update()` silently let a caller change SAC's discount while
     the shaping term and the return statistics kept the old one.
     """
-    from stable_baselines3 import SAC
+    
 
     resolved_kwargs = dict(
         policy="MlpPolicy", learning_rate=3e-4, buffer_size=1_000_000,
         batch_size=256, tau=0.005, ent_coef="auto",
+        train_freq=1, gradient_steps=1,
         policy_kwargs=dict(net_arch=[400, 400]),
     )
     resolved_kwargs.update(sac_kwargs or {})

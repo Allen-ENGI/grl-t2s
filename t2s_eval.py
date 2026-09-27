@@ -1,73 +1,11 @@
 """
 Stage 4: T2S model analysis.
-
-Six public functions. The previous version had sixteen, ten of which nothing
-outside this module ever called, plus a `plot_sample_trajectories` that
-t2s_video now does better and that nothing called at all.
-
-    assert_policies_held_out   verify the evaluation policies were reserved
-    evaluate_runs              evaluate every combo -> {name: report}
-    format_report_table        report -> string table
-    plot_combo_comparison      report -> bar chart
-    collect_eval_trajectories  reference rollouts for reward_preview / video
-    run_full_evaluation        one model's report (used by t2s_video)
-
-Two kinds of "held out", not to be conflated:
-  1. held-out ROWS — the `val` split assigned at collection time and stored in
-     dataset.npz. Interpolation within the same policies.
-  2. held-out POLICIES — checkpoints reserved via Stage 1's `holdout`, never
-     rolled out during collection. Generalization to unseen behaviour.
-`assert_policies_held_out` checks (2) against the recorded manifest rather
-than trusting that whoever ran Stage 1 remembered which files it touched.
-
-WHICH CORRELATIONS MEAN ANYTHING
---------------------------------
-Within one success rollout the truth is max(0, S - i): exactly linear in the
-frame index. So correlating predictions against it is correlating against -i.
-Measured on the observed 73-step-success + 20-frame-tail shape:
-
-    perfect model                    pearson +1.000  spearman +1.000  MAE   0.0
-    predictions x 3                  pearson +1.000  spearman +1.000  MAE  58.1
-    predictions + 100                pearson +1.000  spearman +1.000  MAE 100.0
-    straight ramp ignoring S         pearson +0.989  spearman +0.995  MAE 121.0
-    truth vs. the frame index        pearson +0.989
-
-NO correlation fixes this, because Pearson and Spearman are both invariant to
-a global affine transform:
-
-    error class                   within-traj rho   pooled rho
-    +100 global offset                     1.0000       1.0000
-    x3 global scale                        1.0000       1.0000
-    per-trajectory normalisation           1.0000       0.7997
-    level drifts with trajectory           1.0000       0.8610
-
-Hence the division of labour in the reported metrics:
-  bias, calibration_slope  the ONLY metrics that see a global offset or scale
-                           error. bias is signed; NEGATIVE means the model
-                           claims success is nearer than it is, the dangerous
-                           direction for a reward. calibration_slope is 1.0
-                           when correct.
-  pooled_spearman          across rollouts. The only one that sees a level
-                           consistent within each trajectory but drifting
-                           between them — the observed 62-vs-200 spread.
-  step_slope_error         mean |predicted decrement - 1|. Literally the
-                           quantity reward_fn's difference modes consume, so
-                           the most directly predictive number here.
-  monotonicity_rho         the old correlation, renamed. Shape only. Read it
-                           with max_wrong_direction.
-
-Other corrections: ground truth was off by one (success recorded as the step
-index t rather than the first successful state t+1, so a model reproducing its
-training labels perfectly still scored MAE ~0.8); MAE now excludes the
-post-success tail by default; max_wrong_direction is pre-success only and
-clamped at 0; correlations average in Fisher z, since a plain mean of r is
-biased toward 0 badly near |r|~1.
 """
 import os
 
 import numpy as np
 from scipy.stats import pearsonr, spearmanr
-
+from t2s_model import load_t2s_predictor
 from config import CENSOR_LABEL, SUCCESS_KEY, steps_remaining_curve
 
 CONFIRM_BUFFER = 20          # frames recorded after success
@@ -76,25 +14,7 @@ HIGHER_IS_BETTER = ("pooled_spearman", "monotonicity_rho")
 CORRELATIONS = ("pooled_pearson", "pooled_spearman", "monotonicity_rho")
 # FOUR metrics by default, one per question the reward has to answer:
 #   mae                    does it predict TIME correctly (success rollouts)
-#   step_slope_error       is the per-step DECREMENT right — the quantity the
-#                          shaped reward literally consumes
-#   dead_window_fraction   is there any gradient at all, or sustained flat runs
-#   fail_pred_min          does it stay pessimistic on a trajectory that never
-#                          succeeds — the false-optimism defect
-#
-# Dropped from the default, with reasons:
-#   fail_optimism      = CENSOR_LABEL - fail_pred_min exactly. A mirrored
-#                        duplicate; two panels carried one fact.
-#   calibration_slope  a wrong scale IS a wrong per-step decrement, which
-#                      step_slope_error already measures in the units the
-#                      reward uses.
-#   bias               a constant offset nearly CANCELS in difference shaping
-#                      (it survives only as c*(1-gamma) per step), so it is the
-#                      least reward-relevant of the error terms.
-#   worst_window_*     keeps the same information as dead_window_fraction in a
-#                      less interpretable unit.
-#   the correlations   read ~1.00 for every model on the observed runs.
-# All remain available: metrics=REPORT_METRICS + EXTRA_METRICS.
+
 REPORT_METRICS = ("mae", "bias", "fail_pred_min")
 # REPORT_METRICS = ("mae", "bias", "decrement_mean", "decrement_std", "fail_pred_min")
 EXTRA_METRICS = ("calibration_slope", "step_slope_error", "dead_window_fraction",
@@ -204,15 +124,6 @@ def compute_metrics(preds, truths, success_step=None, window=WINDOW):
     if len(p) >= 2:
         d = -np.diff(p)                                     # predicted decrement
         err = np.abs(d - 1.0)
-        # step_slope_error = mean|d - 1| CONFLATES two different faults, and for
-        # an unbiased model it is mostly a noise measure: mean|d-1| ~= 1.13*sigma.
-        # A perfectly calibrated model with 0.9 of per-step jitter scores 1.00 —
-        # identical to a FLAT prediction, which is the opposite failure. Split it:
-        #   decrement_mean  systematic. 1.0 correct, <1 compressed, 0 flat.
-        #                   The reward is decrement - c, so this IS the reward's
-        #                   mean, shifted.
-        #   decrement_std   noise. Differencing amplifies prediction jitter, and
-        #                   this is the noise the policy receives per step.
         out["decrement_mean"] = float(np.mean(d))
         out["decrement_std"] = float(np.std(d))
         out["step_slope_error"] = float(np.mean(err))
@@ -394,13 +305,7 @@ def run_full_evaluation(predict_fn, success_policy, failure_policy, n_seeds=8,
         unexpected_success_rate=float(np.mean([r["succeeded_unexpectedly"] for r in fails]))
         if fails else None,
         mean_pred_min=float(np.mean([r["pred_min"] for r in fails])) if fails else None)
-    # Promote the failure numbers into `summary` under a fail_ prefix so the
-    # table and the chart can reach them. They were computed, stored, and then
-    # never displayed — which is why a model could look fine on every plotted
-    # panel while predicting "25 steps to success" throughout a trajectory that
-    # never succeeds. The success rollouts come from an expert that goes
-    # straight to the goal, so hovering NEVER OCCURS in them and no
-    # success-scenario metric can see it.
+
     if fails:
         report.setdefault("summary", {}).update(
             # lowest prediction reached on a trajectory that never succeeds.
@@ -785,16 +690,6 @@ def plot_combo_comparison(reports, metrics=REPORT_METRICS, save_path=None,
     bar. Seven metrics in one row made each panel ~180px wide, which is not
     enough to read a label or tell two similar bars apart.
 
-    Every seed is also drawn as a dot, because error bars alone are invisible
-    when the spread is small relative to the bar height — a bar with +/-0.02
-    must not look like one with +/-2.0.
-
-    The count under each bar is how many seeds actually contributed. It is
-    printed because _corr returns None for a CONSTANT prediction and _mean
-    drops those, so a model that flatlines on 5 of 8 seeds silently reports a
-    correlation of 1.00 computed from the other 3. n<8 on a correlation panel
-    means the model was degenerate on the missing seeds, which is worse than
-    a low score, not better.
     """
     import matplotlib.pyplot as plt
 
@@ -900,26 +795,12 @@ def plot_combo_comparison(reports, metrics=REPORT_METRICS, save_path=None,
 
 def evaluate_runs(t2s_run_dir, summary_rows, success_policy, failure_policy,
                   n_seeds=8, dataset_path=None, verbose=True, score_on="rollouts"):
-    """
-    Evaluate every combo in one t2s_model run. Returns {combo: report}.
-
-    score_on="val" scores the held-out val EPISODES instead of live rollouts:
-    dozens of complete trajectories against eight, no simulator, seconds
-    instead of minutes. See evaluate_on_val_episodes for why that is now the
-    better-justified default sample.
-
-    Either way, dataset_path attaches the per-row val evaluation as
-    report["val_split"], and score_on="val" also attaches the live report as
-    report["rollouts"] only if policies are supplied.
-    """
-    import t2s_predict
-
     reports = {}
     for row in summary_rows:
         method, condition = row["combo"].rsplit("_", 1)
         if verbose:
             print(f"  evaluating {row['combo']} ...", flush=True)
-        fn = t2s_predict.load_t2s_predictor(t2s_run_dir, method, condition,
+        fn = load_t2s_predictor(t2s_run_dir, method, condition,
                                             seed=row["best_seed"])
         if score_on == "val":
             if not dataset_path:

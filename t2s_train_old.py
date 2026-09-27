@@ -74,13 +74,9 @@ def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=CON
             "time — see its module docstring for why the split moved out of this file.")
     split_all = raw["split"].astype(str)
 
-    # is_failed_episode = np.array([
-    #     np.all(y_all[episode_ids_all == ep] == censor_label) for ep in episode_ids_all
-    # ])
-    
-    _, inv = np.unique(episode_ids_all, return_inverse=True)
-    is_failed_episode = (np.bincount(inv, weights=(y_all != censor_label)) == 0)[inv]
-    
+    is_failed_episode = np.array([
+        np.all(y_all[episode_ids_all == ep] == censor_label) for ep in episode_ids_all
+    ])
 
     # trim tail: keep failed episodes whole, keep successful episodes only up
     # to confirm_buffer frames past the first zero-T2S frame
@@ -185,8 +181,7 @@ def train_one(prepared, method, condition, run_dir, seed=0, gamma=CENSOR_GAMMA,
 
     def bootstrap_fn(obs_n):
         return target_net.bootstrap_values(obs_n, device)
-    
-    fail_va = is_failed[rows_va]
+
     best, stale = float("inf"), 0
     hist = []
     yb_tr, sup_tr, yb_tr_t, train_pool = None, None, None, None
@@ -229,15 +224,13 @@ def train_one(prepared, method, condition, run_dir, seed=0, gamma=CENSOR_GAMMA,
         with torch.no_grad():
             pred_va = model(Xn_va_t).cpu().numpy()
             pred_va_succ = model(Xn_va_succ_t).cpu().numpy()
-        
-        
         val_mse = float(np.mean((pred_va - y_va) ** 2))
         val_mse_succ = float(np.mean((pred_va_succ - y_va_succ) ** 2))
-        pred_fail = float(pred_va[fail_va].mean()) if fail_va.any() else float("nan")
-        hist.append((ep, val_mse, val_mse_succ, pred_fail))
+        hist.append((ep, val_mse, val_mse_succ))
 
-        if val_mse_succ < best:
-            best, stale = val_mse_succ, 0
+        # evaluate validation performance
+        if val_mse < best:
+            best, stale = val_mse, 0
             torch.save(model.state_dict(), ckpt_path)
         else:
             stale += 1
@@ -276,41 +269,22 @@ def run_all_combos(run_dir, dataset_path, methods=METHODS, conditions=CONDITIONS
                 combo = f"{method}{'boot' if boot else ''}_{condition}"
                 if verbose:
                     print(f"  [{i}/{n_total}] {combo} (gamma={gamma})", flush=True)
-                # model, hist, val_mse = train_one(
-                #     prep, method, condition, run_dir, seed=seed,
-                #     target_clip=target_clip, device=device, gamma=gamma,
-                #     censor_bootstrap=boot)
-                # models[combo] = model
-                # histories[combo] = hist
-                # summary_rows.append(dict(
-                #     combo=combo, method=method, condition=condition,
-                #     censor_scheme=scheme, gamma=gamma, seed=seed,
-                #     val_mse=float(val_mse),
-                #     # val MSE restricted to rows from SUCCESSFUL episodes, at the
-                #     # epoch that minimised overall val MSE. Failed-episode rows
-                #     # carry a censored label, so the overall number partly scores
-                #     # agreement with a fiction.
-                #     val_mse_succ_only=float(hist[np.argmin(hist[:, 1]), 2]),
-                #     # every consumer needs a seed to build the checkpoint filename
-                #     best_seed=seed))
-                
-                
-                model, hist, _ = train_one(
+                model, hist, val_mse = train_one(
                     prep, method, condition, run_dir, seed=seed,
                     target_clip=target_clip, device=device, gamma=gamma,
                     censor_bootstrap=boot)
-                
-                at = int(np.argmin(hist[:, 2]))          # the epoch that was saved
-                np.save(os.path.join(run_dir, f"{combo}_hist.npy"), hist)
                 models[combo] = model
                 histories[combo] = hist
                 summary_rows.append(dict(
                     combo=combo, method=method, condition=condition,
                     censor_scheme=scheme, gamma=gamma, seed=seed,
-                    val_mse=float(hist[at, 1]),
-                    val_mse_succ_only=float(hist[at, 2]),
-                    pred_fail_mean=float(hist[at, 3]),
-                    best_epoch=at,
+                    val_mse=float(val_mse),
+                    # val MSE restricted to rows from SUCCESSFUL episodes, at the
+                    # epoch that minimised overall val MSE. Failed-episode rows
+                    # carry a censored label, so the overall number partly scores
+                    # agreement with a fiction.
+                    val_mse_succ_only=float(hist[np.argmin(hist[:, 1]), 2]),
+                    # every consumer needs a seed to build the checkpoint filename
                     best_seed=seed))
 
     save_normalization(run_dir, prepared["x_mean"], prepared["x_std"])
