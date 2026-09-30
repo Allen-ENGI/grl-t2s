@@ -2,13 +2,12 @@
 """
 STAGE 2 of 4 — T2S model training.
 
-    python run_2_train.py --data-run v2
+    python run_2_t2s.py --data-run v3                              # full grid
+    python run_2_t2s.py --data-run v3 --model tdlambdaboot_all     # one model
 
-Trains the full grid on Stage 1's dataset and stops. Evaluation is
-run_3_eval.py; splitting them means a failed or rethought evaluation costs
-minutes instead of a retrain, and the two manifests say plainly which models
-exist and which have been scored.
-
+Trains on Stage 1's dataset and stops. Evaluation is run_3_eval.py; splitting
+them means a failed or rethought evaluation costs minutes instead of a retrain,
+and the two manifests say plainly which models exist and which have been scored.
 """
 import argparse
 import json
@@ -23,18 +22,31 @@ import t2s_train
 
 STAGE_MANIFEST = "stage_manifest.json"
 
-
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Stage 2: T2S training",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--data-run", required=True, help="run name from run_1_collect.py")
-    p.add_argument("--run-name", default="v6", help="t2s_model run name")
+    p.add_argument("--run-name", default="v8", help="t2s_model run name")
     p.add_argument("--seed", type=int, default=0, help="single training seed")
     p.add_argument("--device", default=None, help="cuda|cpu (default: auto)")
-    p.add_argument("--quick", action="store_true",
-                   help="one combo only — smoke test, not a result")
+    p.add_argument("--model", default=None,
+                   help="train just this combo, e.g. tdlambdaboot_all or mc_succ "
+                        "(default: the full grid)")
     return p.parse_args(argv)
+
+
+def model_grid(name):
+    """'tdlambdaboot_all' -> the one-model grid for run_all_combos."""
+    method, cond = name.rsplit("_", 1)
+    boot = method.endswith("boot")
+    method = method[:-4] if boot else method
+    if method not in t2s_train.METHODS or cond not in t2s_train.CONDITIONS:
+        valid = [f"{m}{b}_{c}" for b in ("", "boot") for m in t2s_train.METHODS
+                 for c in t2s_train.CONDITIONS]
+        raise SystemExit(f"ERROR: unknown model {name!r}. Valid: {valid}")
+    return dict(methods=(method,), conditions=(cond,),
+                censor_schemes=("bootstrap" if boot else "censor",))
 
 
 def main(argv=None):
@@ -50,21 +62,20 @@ def main(argv=None):
               f"Registered: {results.list_runs('data_collection')}\n"
               f"Run:  python run_1_collect.py --run-name {args.data_run}", file=sys.stderr)
         return 1
-    
+
     manifest_path = os.path.join(data_dir, STAGE_MANIFEST)
     if not os.path.exists(manifest_path):
         print(f"ERROR: no {STAGE_MANIFEST} in {data_dir} — that run predates the "
               "staged scripts, or collection did not finish.", file=sys.stderr)
         return 1
-    
+
     with open(manifest_path) as f:
         stage1 = json.load(f)
     if not stage1.get("ok"):
         print(f"WARNING: Stage 1 reported blocking audit failures "
               f"{stage1.get('audit_blocking')}; results here may be meaningless.\n")
 
-    grid = (dict(methods=("td0",), conditions=("succ",), censor_schemes=("bootstrap",))
-            if args.quick else
+    grid = (model_grid(args.model) if args.model else
             dict(methods=t2s_train.METHODS, conditions=t2s_train.CONDITIONS,
                  censor_schemes=t2s_train.CENSOR_SCHEMES))
     n = len(grid["methods"]) * len(grid["conditions"]) * len(grid["censor_schemes"])
@@ -72,7 +83,7 @@ def main(argv=None):
     run_dir = results.new_run_dir(
         "t2s_model", args.run_name,
         meta=dict(stage="2_train", data_run=args.data_run, seed=args.seed,
-                  quick=args.quick, bootstrap_gamma=config.T2S_BOOTSTRAP_GAMMA))
+                  model=args.model, bootstrap_gamma=config.T2S_BOOTSTRAP_GAMMA))
     print(f"=== Stage 2: training {n} model(s) on {args.data_run} "
           f"({stage1['total_episodes']} episodes) -> {run_dir} ===")
     print(f"    device={device}  seed={args.seed}  "

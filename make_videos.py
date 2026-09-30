@@ -19,7 +19,7 @@ import sys
 # ---------------------------------------------------------------------------
 MODELS = None
 
-T2S_RUN = "v4"                      # t2s_model run name (run_2_train.py --run-name)
+T2S_RUN = "v6"                      # t2s_model run name (run_2_train.py --run-name)
 REWARD_MODE = "difference"    # absolute | difference | difference_timed
 SEEDS = (500,)                      # rollout seeds; one video per model per seed
 FPS = None                          # None -> t2s_video.FPS (12)

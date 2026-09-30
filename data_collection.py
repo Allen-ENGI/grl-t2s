@@ -32,7 +32,6 @@ POSE_WINDOW, POSE_STD_THRESH, CONFIRM_FRAMES = 5, 2e-3, 2
 
 
 # ---- control-onset detection --------------------------------------------
-
 def coupling_signals(obs_seq):
     hand, peg = obs_seq[:, HAND_POS_IDX], obs_seq[:, PEG_POS_IDX]
     T = len(obs_seq)

@@ -42,7 +42,7 @@ def parse_args(argv=None):
                    help="episodes per checkpoint per seed")
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2],
                    help="independent passes; the main diversity knob")
-    p.add_argument("--val", type=float, default=0.2, help="validation share")
+    p.add_argument("--val", type=float, default=0.3, help="validation share")
     p.add_argument("--allow-flagged", action="store_true",
                    help="exit 0 even if a blocking audit check fails")
     return p.parse_args(argv)
@@ -98,11 +98,12 @@ def main(argv=None):
         total_episodes=summary["total_episodes"],
         duplicate_fraction=summary["duplicate_fraction"],
         audit_blocking=blocking, audit_advisory=advisory, ok=not blocking)
+    
     with open(os.path.join(run_dir, STAGE_MANIFEST), "w") as f:
         json.dump(manifest, f, indent=2)
 
     print(f"\nwrote {os.path.join(run_dir, STAGE_MANIFEST)}")
-    print(f"next:  python run_2_train.py --data-run {args.run_name} --run-name {args.run_name}")
+    # print(f"next:  python run_2_train.py --data-run {args.run_name} --run-name {args.run_name}")
     return 0 if (manifest["ok"] or args.allow_flagged) else 1
 
 

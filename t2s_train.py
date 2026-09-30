@@ -46,6 +46,10 @@ CONFIRM_BUFFER = 3          # frames kept after success when trimming the tail
 CENSOR_GAMMA = 1.0           # censor scheme only; bootstrap forces < 1
 SEED = 0                     # one seed: see run_all_combos for why not a sweep
 
+REL_WEIGHT = 1.0
+REL_WEIGHT = 0.0
+MAX_GAP = 30
+
 # the grid IS the experiment: three value targets x two data sources x
 # bootstrap-or-not = 12 models
 METHODS = ("mc", "td0", "tdlambda")
@@ -56,7 +60,7 @@ CENSOR_SCHEMES = ("censor", "bootstrap")
 def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=CONFIRM_BUFFER,
                      censor_bootstrap=False):
     """
-    Loads dataset.npz, trims the long flat post-success tail, reads the STORED
+    Loads dataset.npz, trims the long flat poFst-success tail, reads the STORED
     train/val split, and returns everything build_targets/train_one need.
 
     Requires the `split` array written by the current data_collection. A
@@ -182,6 +186,27 @@ def train_one(prepared, method, condition, run_dir, seed=0, gamma=CENSOR_GAMMA,
     Xn_tr_t = torch.as_tensor(Xn_tr, dtype=torch.float32, device=device)
     Xn_va_t = torch.as_tensor(Xn_va, dtype=torch.float32, device=device)
     Xn_va_succ_t = torch.as_tensor(Xn_va_succ, dtype=torch.float32, device=device)
+    
+    
+    # Add new changes 
+    # relative-change loss: pairs from the same successful training episode
+    # ep_ids = prepared["episode_ids_all"]
+    # succ_tr = rows_tr[~is_failed[rows_tr]]
+    
+    to_value = ((lambda n: (1 - gamma ** n) / (1 - gamma)) if censor_bootstrap
+                else (lambda n: n))
+    # X_all_t = torch.as_tensor(Xn_all, dtype=torch.float32, device=device)
+    # v_all_t = torch.as_tensor(to_value(y_all.astype(np.float64)), dtype=torch.float32,
+    #                           device=device)
+
+    # def sample_pairs(n):
+    #     i = np.random.choice(succ_tr, n)
+    #     j = np.minimum(i + np.random.randint(1, MAX_GAP + 1, n), len(ep_ids) - 1)
+    #     keep = ep_ids[j] == ep_ids[i]
+    #     return (torch.as_tensor(i[keep], device=device),
+    #             torch.as_tensor(j[keep], device=device))
+    
+    y_va_succ_v = to_value(y_va_succ.astype(np.float64))      # the model's own target scale
 
     def bootstrap_fn(obs_n):
         return target_net.bootstrap_values(obs_n, device)
@@ -216,12 +241,24 @@ def train_one(prepared, method, condition, run_dir, seed=0, gamma=CENSOR_GAMMA,
                           else np.flatnonzero(sup_tr))
 
         model.train()
-        # truncated frames have no known target -> excluded from the loss
         perm = torch.as_tensor(np.random.permutation(train_pool), device=device)
+        td_sum = pair_sum = 0.0
+        n_td = n_pair = 0
         for s in range(0, len(perm), batch_size):
             b = perm[s:s + batch_size]
             opt.zero_grad()
-            loss = F.mse_loss(model(Xn_tr_t[b]), yb_tr_t[b])
+            td_loss = F.mse_loss(model(Xn_tr_t[b]), yb_tr_t[b])
+            loss = td_loss
+            td_sum, n_td = td_sum + td_loss.item(), n_td + 1
+            
+            # if REL_WEIGHT > 0:
+            #     pi, pj = sample_pairs(len(b))
+            #     if pi.numel() > 0:
+            #         d_pred = model(X_all_t[pi]) - model(X_all_t[pj])
+            #         pair_loss = F.mse_loss(d_pred, v_all_t[pi] - v_all_t[pj])
+            #         loss = loss + REL_WEIGHT * pair_loss
+            #         pair_sum, n_pair = pair_sum + pair_loss.item(), n_pair + 1
+                    
             loss.backward()
             opt.step()
 
@@ -229,15 +266,17 @@ def train_one(prepared, method, condition, run_dir, seed=0, gamma=CENSOR_GAMMA,
         with torch.no_grad():
             pred_va = model(Xn_va_t).cpu().numpy()
             pred_va_succ = model(Xn_va_succ_t).cpu().numpy()
-        
-        
+            
         val_mse = float(np.mean((pred_va - y_va) ** 2))
-        val_mse_succ = float(np.mean((pred_va_succ - y_va_succ) ** 2))
+        val_mse_succ = float(np.mean((pred_va_succ - y_va_succ_v) ** 2))    # selection
+        val_mse_succ_raw = float(np.mean((pred_va_succ - y_va_succ) ** 2))  # raw steps, report
         pred_fail = float(pred_va[fail_va].mean()) if fail_va.any() else float("nan")
-        hist.append((ep, val_mse, val_mse_succ, pred_fail))
+        td_mean = td_sum / max(n_td, 1)
+        pair_mean = pair_sum / n_pair if n_pair else float("nan")
+        hist.append((ep, val_mse, val_mse_succ, pred_fail, val_mse_succ_raw, td_mean, pair_mean))
 
-        if val_mse_succ < best:
-            best, stale = val_mse_succ, 0
+        if val_mse < best:
+            best, stale = val_mse, 0
             torch.save(model.state_dict(), ckpt_path)
         else:
             stale += 1
@@ -300,7 +339,7 @@ def run_all_combos(run_dir, dataset_path, methods=METHODS, conditions=CONDITIONS
                     target_clip=target_clip, device=device, gamma=gamma,
                     censor_bootstrap=boot)
                 
-                at = int(np.argmin(hist[:, 2]))          # the epoch that was saved
+                at = int(np.argmin(hist[:, 1]))          # the epoch that was saved
                 np.save(os.path.join(run_dir, f"{combo}_hist.npy"), hist)
                 models[combo] = model
                 histories[combo] = hist
@@ -308,7 +347,7 @@ def run_all_combos(run_dir, dataset_path, methods=METHODS, conditions=CONDITIONS
                     combo=combo, method=method, condition=condition,
                     censor_scheme=scheme, gamma=gamma, seed=seed,
                     val_mse=float(hist[at, 1]),
-                    val_mse_succ_only=float(hist[at, 2]),
+                    val_mse_succ_only=float(hist[at, 4]),
                     pred_fail_mean=float(hist[at, 3]),
                     best_epoch=at,
                     best_seed=seed))

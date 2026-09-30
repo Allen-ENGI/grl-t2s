@@ -17,7 +17,6 @@ import sys
 # ---- reference trajectories -----------------------------------------
 from stable_baselines3 import SAC
 
-
 # ---- train -----------------------------------------------------------
 import policy_train
 from t2s_model import load_t2s_predictor
@@ -50,13 +49,13 @@ def parse_args(argv=None):
     p.add_argument("--seeds", type=int, nargs="+", default=None,
                    help="RL seeds (default: config.RL_SEEDS = 0 1 2)")
     p.add_argument("--sweep-name", default="sweep_v6")
-    p.add_argument("--reward-mode", default="absolute",
+    p.add_argument("--reward-mode", default="difference",
                    choices=["absolute", "difference", "difference_timed"])
     p.add_argument("--gamma", type=float, default=None,
                    help="RL discount (default: config.RL_GAMMA)")
-    p.add_argument("--timesteps", type=int, default=800_000)
+    p.add_argument("--timesteps", type=int, default=1000_000)
     p.add_argument("--no-norm-reward", dest="norm_reward", action="store_false",
-                   default=True,
+                   default=False,
                    help="train on the RAW T2S reward instead of passing it through "
                         "VecNormalize. VecNormalize divides by a RUNNING std of the "
                         "discounted return, which drifts as the policy improves, so "
@@ -113,7 +112,6 @@ def run_gate(trajectories, predictors, reward_mode, gamma, verbose=True,
              time_penalty=None):
     """Reward preview + pass/fail verdict. Returns (verdicts, pred_maxes)."""
     
-
     preview = reward_preview.preview_reward(
         trajectories, predictors, reward_modes=(reward_mode,), gamma=gamma,
         time_penalty=time_penalty)
@@ -126,7 +124,6 @@ def run_gate(trajectories, predictors, reward_mode, gamma, verbose=True,
 
 def main(argv=None):
     args = parse_args(argv)
-
 
     gamma = config.RL_GAMMA if args.gamma is None else args.gamma
     seeds = list(config.RL_SEEDS if args.seeds is None else args.seeds)

@@ -99,6 +99,24 @@ def best_time_shift(t2s_progress, metaworld):
             best_value, best_shift = value, shift
     return best_shift
 
+def cross_correlation(t2s_progress, metaworld, window=CROSS_CORRELATION_WINDOW,
+                      max_shift=MAX_SHIFT):
+    """
+    Correlation between the two series' changes at every time shift.
+    Returns a list over shifts -max_shift .. +max_shift (None where undefined).
+    Positive shift: T2S's change is compared with MetaWorld's change that many steps later.
+    """
+    
+    dx = t2s_progress[window:] - t2s_progress[:-window]
+    dy = metaworld[window:] - metaworld[:-window]
+    curve = []
+    for shift in range(-max_shift, max_shift + 1):
+        if shift >= 0:
+            a, b = dx[:len(dx) - shift], dy[shift:]
+        else:
+            a, b = dx[-shift:], dy[:len(dy) + shift]
+        curve.append(correlation(a, b))
+    return curve
 
 def trajectory_measures(t2s_progress, metaworld):
     """Every per-trajectory measure, by readable name. Add or remove entries here."""
@@ -241,19 +259,22 @@ def main(argv=None):
             outcome = "successful" if t["success_step"] is not None else "failed"
             t2s_progress, metaworld = aligned_series(predictions, t["rewards"], t["success_step"])
             n = len(metaworld)
+            
             row = dict(model=model, seed=t["seed"], outcome=outcome,
                        **trajectory_measures(t2s_progress, metaworld))
             row["Prediction at the start"] = float(predictions[0])
             row["Prediction at the end"] = float(predictions[n])
             row["MetaWorld reward at the end"] = float(metaworld[-1])
+            row["cross correlation"] = cross_correlation(t2s_progress, metaworld)            
             rows.append(row)
+            
             if not any(r["outcome"] == outcome for r in rows[:-1]):
                 plot_example(f"{model}, {outcome} episode (seed {t['seed']})", predictions,
                              t["rewards"], t["success_step"],
                              os.path.join(out_dir, f"{model}_{outcome}_example.png"))
         all_rows += rows
 
-        names = [k for k in rows[0] if k not in ("model", "seed", "outcome")]
+        names = [k for k in rows[0] if k not in ("model", "seed", "outcome", "cross correlation")]
         summary[model] = {o: {name: average_with_range([r[name] for r in rows if r["outcome"] == o])
                               for name in names} for o in ("successful", "failed")}
         counts = {o: sum(r["outcome"] == o for r in rows) for o in ("successful", "failed")}

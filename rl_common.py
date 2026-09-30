@@ -1,220 +1,62 @@
-"""
-Shared SAC training machinery, used by BOTH:
-  - expert_train.py   (Stage 1: pretrain against the environment's own reward)
-  - policy_train.py   (Stage 5: train against the frozen T2S reward)
+from config import RL_GAMMA, TIME_PENALTY, T2S_PRED_CLIP_MAX
 
-One copy here means a fix to eval logic never needs to be applied twice.
-"""
-import json
-import os
-import time
-import torch
-import numpy as np
-from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import BaseCallback
+REWARD_MODES = ("absolute", "difference", "difference_timed")
 
-from config import SUCCESS_KEY, RL_GAMMA
-from progress import compute_progress_metrics
+# kept as module-level names because callers pass time_penalty=None to mean
+# "use the default"; the values themselves live in config.
+DEFAULT_TIME_PENALTY = TIME_PENALTY
+DEFAULT_GAMMA = RL_GAMMA
+
+# modes whose arithmetic involves the shaping potential, and therefore gamma
+SHAPED_MODES = ("difference", "difference_timed")
 
 
-class SuccessRateCallback(BaseCallback):
-
-    def __init__(self, eval_env, ckpt_dir, eval_freq=10_000, n_eval_episodes=10,
-                 ckpt_freq=100_000, max_ep_steps=500, ckpt_prefix="policy",
-                 eval_seed_base=10_000, eval_deterministic=False, verbose=0):
-        super().__init__(verbose)
-        self.eval_env = eval_env
-        self.eval_freq = eval_freq
-        self.n_eval_episodes = n_eval_episodes
-        self.ckpt_dir = ckpt_dir
-        self.ckpt_freq = ckpt_freq
-        self.max_ep_steps = max_ep_steps
-        self.ckpt_prefix = ckpt_prefix
-        self.eval_seed_base = eval_seed_base
-        self.eval_deterministic = eval_deterministic
-        os.makedirs(ckpt_dir, exist_ok=True)
-        self.history = []
-
-    def _run_eval_episode(self, seed):
-        """
-        Returns (success_step|None, progress_metrics_dict).
-
-        success_step follows the package-wide contract in config: the index of
-        the first state that IS successful, i.e. t+1 for a flag returned by the
-        step out of s_t. It used to record t, one frame early, which shifted
-        every reported time-to-success down by one and disagreed with the
-        training labels built by data_collection.
-
-        Progress metrics are model-independent (peg-to-goal distance, control
-        onset) so runs that all score 0% success can still be ranked — see
-        progress.py for why cumulative shaped reward cannot serve this role.
-        """
-  
-
-        # Seeding torch for a reproducible eval used to LEAVE the global RNG
-        # reseeded, so every eval silently reset SAC's exploration stream and
-        # changed the training run it was supposed to be observing. Save and
-        # restore around the episode.
-        rng_state = torch.get_rng_state()
-        obs, _ = self.eval_env.reset(seed=seed)
-        if not self.eval_deterministic:
-            # the policy's own sampling is the only source of episode-to-episode
-            # variation on a pinned scene, so seed it explicitly to keep the
-            # eval reproducible across runs while still varying within a run
-            torch.manual_seed(seed)
-        obs_list, success_step = [], None
-        preds, rewards = [], []
-        for t in range(self.max_ep_steps):
-            obs_list.append(np.asarray(obs, dtype=np.float32).copy())
-            action, _ = self.model.predict(obs, deterministic=self.eval_deterministic)
-            obs, _reward, terminated, truncated, info = self.eval_env.step(action)
-            # Time2SuccessRewardWrapper publishes these and nothing was reading
-            # them. They are the only in-training view of the REWARD ITSELF:
-            # success_rate says whether the task was solved, these say what the
-            # policy was being paid while it wasn't.
-            if "t2s_pred" in info:
-                preds.append(float(info["t2s_pred"]))
-            if "t2s_reward" in info:
-                rewards.append(float(info["t2s_reward"]))
-            if info.get(SUCCESS_KEY, 0) and success_step is None:
-                success_step = t + 1        # the state AFTER this step is the successful one
-            if terminated or truncated:
-                break
-        torch.set_rng_state(rng_state)      # training continues undisturbed
-        # record the final state so index success_step always exists
-        obs_list.append(np.asarray(obs, dtype=np.float32).copy())
-        m = compute_progress_metrics(np.array(obs_list), success_step)
-        if preds:
-            p = np.asarray(preds)
-            m["t2s_pred_min"] = float(p.min())
-            m["t2s_pred_final"] = float(p[-1])
-            # THE false-optimism detector, live: the policy reached a state the
-            # model scores as nearly solved, and then did not solve it. This is
-            # the empty-gripper hover as a number, during training, without
-            # waiting for a video.
-            m["false_optimism"] = float(p.min()) if success_step is None else None
-        if rewards:
-            r = np.asarray(rewards)
-            m["reward_mean"] = float(r.mean())
-            m["reward_total"] = float(r.sum())
-            # share of steps paying >= 0 while the episode never succeeds: the
-            # policy being paid to do something that does not work
-            m["reward_nonneg_frac"] = (float(np.mean(r >= 0))
-                                       if success_step is None else None)
-            # no gradient on these steps
-            m["dead_step_frac"] = float(np.mean(np.abs(r) < 1e-3))
-        return success_step, m
-
-    def _on_step(self) -> bool:
-        # Use num_timesteps (total ENVIRONMENT steps across all parallel envs),
-        # not n_calls. The modulo is a range check rather than == 0 because
-        # num_timesteps jumps by n_envs each call and can step over an exact
-        # multiple.
-        n_envs = getattr(self.training_env, "num_envs", 1)
-
-        if self.num_timesteps % self.ckpt_freq < n_envs:
-            path = os.path.join(self.ckpt_dir, f"{self.ckpt_prefix}_{self.num_timesteps}.zip")
-            self.model.save(path)
-            if self.verbose:
-                print(f"[ckpt] saved {path}")
-
-        if self.num_timesteps % self.eval_freq < n_envs:
-            from progress import aggregate_progress_metrics
-
-            results = [self._run_eval_episode(self.eval_seed_base + len(self.history) * 1000 + i)
-                       for i in range(self.n_eval_episodes)]
-            success_steps = [s for s, _m in results]
-            progress = aggregate_progress_metrics([m for _s, m in results])
-
-            success_rate = sum(s is not None for s in success_steps) / self.n_eval_episodes
-            times = [s for s in success_steps if s is not None]
-            mean_t2s = float(np.mean(times)) if times else None
-
-            self.logger.record("eval/success_rate", success_rate)
-            if mean_t2s is not None:
-                self.logger.record("eval/mean_time_to_success", mean_t2s)
-            for key in ("mean_min_hand_peg_distance", "best_min_hand_peg_distance",
-                        "mean_min_peg_goal_distance", "best_min_peg_goal_distance",
-                        "mean_final_peg_goal_distance", "peg_moved_rate",
-                        "control_rate", "mean_obs_movement",
-                        # the reward's own behaviour during training
-                        "mean_t2s_pred_min", "mean_false_optimism",
-                        "mean_reward_mean", "mean_reward_nonneg_frac",
-                        "mean_dead_step_frac"):
-                if progress.get(key) is not None:
-                    self.logger.record(f"eval/{key}", progress[key])
-
-            entry = dict(step=self.num_timesteps, success_rate=success_rate,
-                         mean_time_to_success=mean_t2s,
-                         raw_time_to_success=success_steps, timestamp=time.time())
-            entry.update(progress)
-            self.history.append(entry)
-            with open(os.path.join(self.ckpt_dir, "eval_history.json"), "w") as f:
-                json.dump(self.history, f, indent=2)
-            if self.verbose:
-                hd = progress.get("mean_min_hand_peg_distance")
-                pd = progress.get("mean_min_peg_goal_distance")
-                print(f"[eval @ {self.num_timesteps}] succ={success_rate:.2f} "
-                      f"hand->peg={f'{hd:.4f}' if hd is not None else '--'} "
-                      f"peg->goal={f'{pd:.4f}' if pd is not None else '--'} "
-                      f"peg_moved={progress.get('peg_moved_rate')} "
-                      f"ctrl={progress.get('control_rate')}")
-        return True
+def step_reward(prev_pred, pred_now, reward_mode="difference_timed",
+                time_penalty=DEFAULT_TIME_PENALTY, gamma=DEFAULT_GAMMA):
+    
+    if reward_mode == "absolute":
+        return -pred_now                                         # no gamma: real per-step cost
+    if reward_mode == "difference":
+        return prev_pred - gamma * pred_now                      # Ng shaping, Phi = -pred
+    if reward_mode == "difference_timed":
+        return prev_pred - gamma * pred_now - time_penalty       # shaping + the objective
+    raise ValueError(f"unknown reward_mode {reward_mode!r}, expected one of {REWARD_MODES}")
 
 
-def train_sac(train_env, eval_env, run_dir, total_timesteps, ckpt_prefix="policy",
-              eval_freq=10_000, ckpt_freq=100_000, n_eval_episodes=10,
-              smoke_test_steps=5_000, seed=0, sac_kwargs=None, tb_subdir="tb",
-              smoke_counts_toward_total=True,
-              gamma=RL_GAMMA, n_eval_seeds_base=10_000):
+def hover_reward(pred_level, reward_mode="difference_timed",
+                 time_penalty=DEFAULT_TIME_PENALTY, gamma=DEFAULT_GAMMA):
     """
-    Generic SAC training loop: smoke test, then full run, saving into run_dir.
-    `train_env` must already be wrapped as needed by the caller (VecMonitor,
-    reward wrapper, VecNormalize, etc.) — this function is reward-source-agnostic,
-    which is what lets Stage 1 (real env reward) and Stage 5 (T2S reward) share it.
+    What this reward pays for a step that changes nothing, at a constant
+    prediction of `pred_level`. Must be negative, or freezing is an optimum.
+    """
+    return step_reward(pred_level, pred_level, reward_mode=reward_mode,
+                       time_penalty=time_penalty, gamma=gamma)
 
-    gamma is an explicit argument rather than buried in the kwargs defaults
-    because the T2S reward wrapper and VecNormalize need the SAME value, and
-    `sac_kwargs.update()` silently let a caller change SAC's discount while
-    the shaping term and the return statistics kept the old one.
+def assert_shaping_gamma_safe(gamma=DEFAULT_GAMMA, time_penalty=DEFAULT_TIME_PENALTY,
+                              pred_max=T2S_PRED_CLIP_MAX, reward_mode="difference_timed"):
+    
+    """
+    Refuse a (gamma, time_penalty, pred_max) combination that pays the policy
+    to stand still. Raises ValueError with the numbers rather than letting a
+    sweep spend hours discovering it as a hovering policy.
+
+    Call with pred_max set to the LARGEST prediction the chosen T2S model
+    actually emits (reward_preview reports it), not just the clip ceiling —
+    a bootstrap-trained model saturating near 100 is safe at gamma=0.995,
+    while a censor-trained model reaching 300 is not.
     """
     
-
-    resolved_kwargs = dict(
-        policy="MlpPolicy", learning_rate=3e-4, buffer_size=1_000_000,
-        batch_size=256, tau=0.005, ent_coef="auto",
-        train_freq=1, gradient_steps=1,
-        policy_kwargs=dict(net_arch=[400, 400]),
-    )
-    resolved_kwargs.update(sac_kwargs or {})
-    if "gamma" in resolved_kwargs and resolved_kwargs["gamma"] != gamma:
+    if reward_mode not in SHAPED_MODES:
+        return True
+    r = hover_reward(pred_max, reward_mode=reward_mode,
+                     time_penalty=time_penalty, gamma=gamma)
+    if r >= 0:
         raise ValueError(
-            f"sac_kwargs sets gamma={resolved_kwargs['gamma']} but train_sac was called with "
-            f"gamma={gamma}. The reward wrapper's shaping term and VecNormalize both use the "
-            "train_sac value, so these must not differ — pass gamma= instead of sac_kwargs.")
-    resolved_kwargs["gamma"] = gamma
-
-    model = SAC(env=train_env, tensorboard_log=os.path.join(run_dir, tb_subdir),
-                verbose=0, seed=seed, **resolved_kwargs)
-
-    if smoke_test_steps:
-        smoke_cb = SuccessRateCallback(eval_env, run_dir, eval_freq=min(500, smoke_test_steps),
-                                       n_eval_episodes=3, ckpt_freq=smoke_test_steps + 1,
-                                       ckpt_prefix=ckpt_prefix,
-                                       eval_seed_base=n_eval_seeds_base + 500_000)
-        model.learn(total_timesteps=smoke_test_steps, callback=smoke_cb, tb_log_name="smoke")
-
-    main_cb = SuccessRateCallback(eval_env, run_dir, eval_freq=eval_freq,
-                                  n_eval_episodes=n_eval_episodes, ckpt_freq=ckpt_freq,
-                                  ckpt_prefix=ckpt_prefix, eval_seed_base=n_eval_seeds_base,
-                                  verbose=1)
-    # reset_num_timesteps=False continues the counter, so a 3k smoke test plus
-    # a 400k main run reported 403k. Subtract it so "400k" means 400k and two
-    # runs with different smoke settings stay comparable.
-    main_steps = (max(total_timesteps - (smoke_test_steps or 0), 1)
-                  if smoke_counts_toward_total else total_timesteps)
-    model.learn(total_timesteps=main_steps, callback=main_cb,
-                tb_log_name="train", reset_num_timesteps=False)
-
-    model.save(os.path.join(run_dir, f"{ckpt_prefix}_final"))
-    return model, main_cb.history
+            f"reward_mode={reward_mode!r} with gamma={gamma}, time_penalty={time_penalty}, "
+            f"max prediction {pred_max} pays r={r:+.3f} per step for standing still, so "
+            f"freezing is a local optimum (this is the empty-handed hovering failure).\n"
+            f"Need (1-gamma)*pred_max < time_penalty, i.e. gamma > "
+            f"{1 - time_penalty / pred_max:.5f} at this pred_max, or a larger time_penalty "
+            f"(> {(1 - gamma) * pred_max:.3f})."
+        )
+    return True
