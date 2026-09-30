@@ -32,8 +32,9 @@ STAGE_MANIFEST = "stage_manifest.json"
 
 # constants, not flags: nobody chooses these per run
 PREVIEW_SEEDS = (500, 501, 502)   # reference trajectories for the reward gate
-EVAL_FREQ = CKPT_FREQ = 50_000 #10_000
-N_EVAL_EPISODES = 10 #5
+EVAL_FREQ = 100_000
+CKPT_FREQ = 50_000 #10_000
+N_EVAL_EPISODES = 5 #5
 
 
 def parse_args(argv=None):
@@ -49,7 +50,7 @@ def parse_args(argv=None):
     p.add_argument("--seeds", type=int, nargs="+", default=None,
                    help="RL seeds (default: config.RL_SEEDS = 0 1 2)")
     p.add_argument("--sweep-name", default="sweep_v6")
-    p.add_argument("--reward-mode", default="difference",
+    p.add_argument("--reward-mode", default="difference_timed",
                    choices=["absolute", "difference", "difference_timed"])
     p.add_argument("--gamma", type=float, default=None,
                    help="RL discount (default: config.RL_GAMMA)")

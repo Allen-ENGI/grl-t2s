@@ -33,13 +33,13 @@ def main():
     p.add_argument("--policy-run", required=True)
     p.add_argument("--t2s-run", required=True, help="for the prediction overlay")
     p.add_argument("--model", required=True, help="T2S combo for the overlay")
-    p.add_argument("--metric", default="mean_min_hand_peg_distance",
+    p.add_argument("--metric", default="mean_min_peg_goal_distance",
                    choices=["mean_min_peg_goal_distance", "best_min_peg_goal_distance",
                             "mean_final_peg_goal_distance", "best_min_hand_peg_distance"],
                    help="mean_* = averaged over eval episodes (robust); best_* = single closest episode")
     p.add_argument("--checkpoint", default=None, help="film this one instead of the closest")
     p.add_argument("--seeds", type=int, nargs="+", default=[500])
-    p.add_argument("--reward-mode", default="difference",
+    p.add_argument("--reward-mode", default="difference_timed",
                    choices=["absolute", "difference", "difference_timed"])
     p.add_argument("--list", action="store_true", help="print the ranking and stop")
     args = p.parse_args()

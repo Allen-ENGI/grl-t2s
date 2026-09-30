@@ -24,7 +24,7 @@ from t2s_model import load_t2s_predictor
 
 
 def train_policy(run_dir, predict_t2s, reward_mode="difference", total_timesteps=400_000,
-                 n_envs=4, eval_freq=10_000, ckpt_freq=50_000, n_eval_episodes=5,
+                 n_envs=1, eval_freq=10_000, ckpt_freq=50_000, n_eval_episodes=5,
                  seed=0, smoke_test_steps=3_000, time_penalty=TIME_PENALTY,
                  gamma=RL_GAMMA, terminate_on_success=True, norm_reward=True,
                  pred_max_for_gamma_check=None, ent_coef="auto",
