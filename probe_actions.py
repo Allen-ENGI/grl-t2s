@@ -29,7 +29,7 @@ import config
 import results
 from config import SUCCESS_KEY, HAND_POS_IDX, PEG_POS_IDX, GOAL_POS_IDX
 from env_utils import make_fixed_scene_env
-from eval_policy import snapshot, restore
+from Help_functions.eval_policy import snapshot, restore
 from reward_fn import step_reward
 from t2s_model import load_t2s_predictor
 
