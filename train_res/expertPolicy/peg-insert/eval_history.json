@@ -1,0 +1,1352 @@
+[
+  {
+    "step": 10000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787446251.0531783
+  },
+  {
+    "step": 20000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787446469.5882628
+  },
+  {
+    "step": 30000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787446679.8192217
+  },
+  {
+    "step": 40000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787446889.2336655
+  },
+  {
+    "step": 50000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787447103.2954907
+  },
+  {
+    "step": 60000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787447304.2190034
+  },
+  {
+    "step": 70000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787447520.592369
+  },
+  {
+    "step": 80000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787447739.7583847
+  },
+  {
+    "step": 90000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787447957.12204
+  },
+  {
+    "step": 100000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787448176.2550015
+  },
+  {
+    "step": 110000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787448394.9557166
+  },
+  {
+    "step": 120000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787448613.5921938
+  },
+  {
+    "step": 130000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787448814.6211727
+  },
+  {
+    "step": 140000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787449015.764596
+  },
+  {
+    "step": 150000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787449209.7796268
+  },
+  {
+    "step": 160000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787449407.2796242
+  },
+  {
+    "step": 170000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787449598.463133
+  },
+  {
+    "step": 180000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787449783.4812
+  },
+  {
+    "step": 190000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787449978.517795
+  },
+  {
+    "step": 200000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787450163.2909465
+  },
+  {
+    "step": 210000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787450353.9037685
+  },
+  {
+    "step": 220000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787450537.8503885
+  },
+  {
+    "step": 230000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787450730.380411
+  },
+  {
+    "step": 240000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787450918.1707735
+  },
+  {
+    "step": 250000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787451113.6618512
+  },
+  {
+    "step": 260000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787451305.0508678
+  },
+  {
+    "step": 270000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787451493.7921343
+  },
+  {
+    "step": 280000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787451690.1328976
+  },
+  {
+    "step": 290000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787451889.7681587
+  },
+  {
+    "step": 300000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787452079.0793574
+  },
+  {
+    "step": 310000,
+    "success_rate": 0.0,
+    "mean_time_to_success": null,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787452268.343667
+  },
+  {
+    "step": 320000,
+    "success_rate": 0.3,
+    "mean_time_to_success": 172.66666666666666,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      168,
+      null,
+      168,
+      null,
+      null,
+      null,
+      182
+    ],
+    "timestamp": 1787452458.4423442
+  },
+  {
+    "step": 330000,
+    "success_rate": 0.1,
+    "mean_time_to_success": 48.0,
+    "raw_time_to_success": [
+      48,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787452652.0116987
+  },
+  {
+    "step": 340000,
+    "success_rate": 0.7,
+    "mean_time_to_success": 70.42857142857143,
+    "raw_time_to_success": [
+      72,
+      66,
+      72,
+      67,
+      78,
+      56,
+      null,
+      null,
+      null,
+      82
+    ],
+    "timestamp": 1787452856.1905034
+  },
+  {
+    "step": 350000,
+    "success_rate": 0.3,
+    "mean_time_to_success": 82.0,
+    "raw_time_to_success": [
+      83,
+      null,
+      null,
+      81,
+      null,
+      null,
+      null,
+      null,
+      null,
+      82
+    ],
+    "timestamp": 1787453047.078105
+  },
+  {
+    "step": 360000,
+    "success_rate": 0.6,
+    "mean_time_to_success": 68.33333333333333,
+    "raw_time_to_success": [
+      66,
+      null,
+      null,
+      79,
+      null,
+      68,
+      62,
+      54,
+      81,
+      null
+    ],
+    "timestamp": 1787453250.1728644
+  },
+  {
+    "step": 370000,
+    "success_rate": 0.6,
+    "mean_time_to_success": 73.16666666666667,
+    "raw_time_to_success": [
+      49,
+      76,
+      null,
+      85,
+      111,
+      null,
+      49,
+      null,
+      69,
+      null
+    ],
+    "timestamp": 1787453453.5047803
+  },
+  {
+    "step": 380000,
+    "success_rate": 0.8,
+    "mean_time_to_success": 79.5,
+    "raw_time_to_success": [
+      79,
+      null,
+      74,
+      62,
+      107,
+      56,
+      56,
+      140,
+      null,
+      62
+    ],
+    "timestamp": 1787453653.2845929
+  },
+  {
+    "step": 390000,
+    "success_rate": 0.4,
+    "mean_time_to_success": 85.75,
+    "raw_time_to_success": [
+      null,
+      null,
+      null,
+      65,
+      89,
+      62,
+      null,
+      127,
+      null,
+      null
+    ],
+    "timestamp": 1787453853.484486
+  },
+  {
+    "step": 400000,
+    "success_rate": 0.7,
+    "mean_time_to_success": 89.42857142857143,
+    "raw_time_to_success": [
+      49,
+      50,
+      121,
+      null,
+      68,
+      85,
+      143,
+      null,
+      null,
+      110
+    ],
+    "timestamp": 1787454052.6921153
+  },
+  {
+    "step": 410000,
+    "success_rate": 0.8,
+    "mean_time_to_success": 94.125,
+    "raw_time_to_success": [
+      122,
+      74,
+      50,
+      null,
+      57,
+      180,
+      128,
+      57,
+      null,
+      85
+    ],
+    "timestamp": 1787454252.2749844
+  },
+  {
+    "step": 420000,
+    "success_rate": 0.9,
+    "mean_time_to_success": 92.11111111111111,
+    "raw_time_to_success": [
+      68,
+      null,
+      327,
+      68,
+      56,
+      58,
+      72,
+      62,
+      59,
+      59
+    ],
+    "timestamp": 1787454451.6491165
+  },
+  {
+    "step": 430000,
+    "success_rate": 0.7,
+    "mean_time_to_success": 96.42857142857143,
+    "raw_time_to_success": [
+      null,
+      null,
+      74,
+      67,
+      67,
+      280,
+      null,
+      65,
+      54,
+      68
+    ],
+    "timestamp": 1787454661.53896
+  },
+  {
+    "step": 440000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 72.5,
+    "raw_time_to_success": [
+      69,
+      49,
+      75,
+      105,
+      51,
+      83,
+      49,
+      75,
+      100,
+      69
+    ],
+    "timestamp": 1787454866.2550592
+  },
+  {
+    "step": 450000,
+    "success_rate": 0.9,
+    "mean_time_to_success": 64.88888888888889,
+    "raw_time_to_success": [
+      50,
+      70,
+      70,
+      62,
+      null,
+      69,
+      78,
+      78,
+      47,
+      60
+    ],
+    "timestamp": 1787455066.9350855
+  },
+  {
+    "step": 460000,
+    "success_rate": 0.9,
+    "mean_time_to_success": 69.0,
+    "raw_time_to_success": [
+      67,
+      55,
+      null,
+      47,
+      77,
+      57,
+      150,
+      52,
+      52,
+      64
+    ],
+    "timestamp": 1787455266.1380599
+  },
+  {
+    "step": 470000,
+    "success_rate": 0.9,
+    "mean_time_to_success": 62.55555555555556,
+    "raw_time_to_success": [
+      48,
+      null,
+      48,
+      46,
+      66,
+      58,
+      58,
+      139,
+      50,
+      50
+    ],
+    "timestamp": 1787455466.1213458
+  },
+  {
+    "step": 480000,
+    "success_rate": 0.7,
+    "mean_time_to_success": 71.57142857142857,
+    "raw_time_to_success": [
+      69,
+      null,
+      134,
+      60,
+      null,
+      52,
+      79,
+      61,
+      46,
+      null
+    ],
+    "timestamp": 1787455667.1849086
+  },
+  {
+    "step": 490000,
+    "success_rate": 0.7,
+    "mean_time_to_success": 62.42857142857143,
+    "raw_time_to_success": [
+      62,
+      63,
+      62,
+      68,
+      62,
+      null,
+      null,
+      67,
+      null,
+      53
+    ],
+    "timestamp": 1787455867.7491577
+  },
+  {
+    "step": 500000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 63.5,
+    "raw_time_to_success": [
+      67,
+      60,
+      97,
+      53,
+      75,
+      63,
+      50,
+      56,
+      56,
+      58
+    ],
+    "timestamp": 1787456066.6574454
+  },
+  {
+    "step": 510000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 83.0,
+    "raw_time_to_success": [
+      71,
+      181,
+      134,
+      69,
+      72,
+      74,
+      46,
+      47,
+      84,
+      52
+    ],
+    "timestamp": 1787456265.904433
+  },
+  {
+    "step": 520000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 93.4,
+    "raw_time_to_success": [
+      75,
+      330,
+      70,
+      46,
+      58,
+      49,
+      46,
+      95,
+      60,
+      105
+    ],
+    "timestamp": 1787456465.2464368
+  },
+  {
+    "step": 530000,
+    "success_rate": 0.9,
+    "mean_time_to_success": 79.77777777777777,
+    "raw_time_to_success": [
+      null,
+      74,
+      67,
+      51,
+      116,
+      81,
+      99,
+      54,
+      99,
+      77
+    ],
+    "timestamp": 1787456663.7443674
+  },
+  {
+    "step": 540000,
+    "success_rate": 0.9,
+    "mean_time_to_success": 59.77777777777778,
+    "raw_time_to_success": [
+      65,
+      66,
+      52,
+      null,
+      60,
+      60,
+      73,
+      58,
+      57,
+      47
+    ],
+    "timestamp": 1787456863.5593886
+  },
+  {
+    "step": 550000,
+    "success_rate": 0.3,
+    "mean_time_to_success": 72.33333333333333,
+    "raw_time_to_success": [
+      null,
+      55,
+      null,
+      104,
+      58,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    "timestamp": 1787457063.214298
+  },
+  {
+    "step": 560000,
+    "success_rate": 0.8,
+    "mean_time_to_success": 61.0,
+    "raw_time_to_success": [
+      56,
+      null,
+      57,
+      63,
+      63,
+      null,
+      47,
+      67,
+      67,
+      68
+    ],
+    "timestamp": 1787457262.5756586
+  },
+  {
+    "step": 570000,
+    "success_rate": 0.7,
+    "mean_time_to_success": 62.285714285714285,
+    "raw_time_to_success": [
+      null,
+      59,
+      56,
+      49,
+      71,
+      55,
+      58,
+      null,
+      88,
+      null
+    ],
+    "timestamp": 1787457461.612737
+  },
+  {
+    "step": 580000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 63.5,
+    "raw_time_to_success": [
+      46,
+      49,
+      86,
+      52,
+      53,
+      54,
+      111,
+      48,
+      71,
+      65
+    ],
+    "timestamp": 1787457662.523589
+  },
+  {
+    "step": 590000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 66.1,
+    "raw_time_to_success": [
+      64,
+      53,
+      79,
+      68,
+      111,
+      60,
+      54,
+      51,
+      53,
+      68
+    ],
+    "timestamp": 1787457863.6637042
+  },
+  {
+    "step": 600000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 75.3,
+    "raw_time_to_success": [
+      105,
+      55,
+      49,
+      93,
+      85,
+      60,
+      68,
+      117,
+      55,
+      66
+    ],
+    "timestamp": 1787458064.989105
+  },
+  {
+    "step": 610000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 81.2,
+    "raw_time_to_success": [
+      81,
+      75,
+      56,
+      60,
+      58,
+      220,
+      72,
+      69,
+      52,
+      69
+    ],
+    "timestamp": 1787458267.239027
+  },
+  {
+    "step": 620000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 61.2,
+    "raw_time_to_success": [
+      79,
+      52,
+      53,
+      70,
+      88,
+      67,
+      73,
+      53,
+      39,
+      38
+    ],
+    "timestamp": 1787458470.490576
+  },
+  {
+    "step": 630000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 99.8,
+    "raw_time_to_success": [
+      89,
+      317,
+      47,
+      61,
+      57,
+      47,
+      89,
+      51,
+      56,
+      184
+    ],
+    "timestamp": 1787458671.2636073
+  },
+  {
+    "step": 640000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 58.3,
+    "raw_time_to_success": [
+      62,
+      74,
+      48,
+      65,
+      43,
+      43,
+      59,
+      71,
+      69,
+      49
+    ],
+    "timestamp": 1787458872.0582857
+  },
+  {
+    "step": 650000,
+    "success_rate": 0.9,
+    "mean_time_to_success": 52.22222222222222,
+    "raw_time_to_success": [
+      48,
+      52,
+      45,
+      53,
+      49,
+      53,
+      60,
+      null,
+      51,
+      59
+    ],
+    "timestamp": 1787459073.6163878
+  },
+  {
+    "step": 660000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 75.1,
+    "raw_time_to_success": [
+      131,
+      67,
+      61,
+      59,
+      54,
+      63,
+      131,
+      53,
+      71,
+      61
+    ],
+    "timestamp": 1787459275.229158
+  },
+  {
+    "step": 670000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 59.0,
+    "raw_time_to_success": [
+      83,
+      45,
+      51,
+      67,
+      53,
+      51,
+      66,
+      59,
+      66,
+      49
+    ],
+    "timestamp": 1787459477.9658473
+  },
+  {
+    "step": 680000,
+    "success_rate": 0.9,
+    "mean_time_to_success": 51.888888888888886,
+    "raw_time_to_success": [
+      43,
+      48,
+      43,
+      41,
+      65,
+      48,
+      55,
+      65,
+      null,
+      59
+    ],
+    "timestamp": 1787459678.8405604
+  },
+  {
+    "step": 690000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 53.5,
+    "raw_time_to_success": [
+      71,
+      46,
+      54,
+      53,
+      51,
+      44,
+      48,
+      58,
+      45,
+      65
+    ],
+    "timestamp": 1787459878.3530047
+  },
+  {
+    "step": 700000,
+    "success_rate": 0.9,
+    "mean_time_to_success": 55.77777777777778,
+    "raw_time_to_success": [
+      63,
+      51,
+      52,
+      55,
+      52,
+      53,
+      null,
+      68,
+      56,
+      52
+    ],
+    "timestamp": 1787460079.7295115
+  },
+  {
+    "step": 710000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 60.0,
+    "raw_time_to_success": [
+      61,
+      66,
+      56,
+      56,
+      61,
+      50,
+      63,
+      63,
+      63,
+      61
+    ],
+    "timestamp": 1787460282.5638616
+  },
+  {
+    "step": 720000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 62.6,
+    "raw_time_to_success": [
+      128,
+      46,
+      65,
+      44,
+      55,
+      57,
+      46,
+      68,
+      63,
+      54
+    ],
+    "timestamp": 1787460484.9498625
+  },
+  {
+    "step": 730000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 49.3,
+    "raw_time_to_success": [
+      52,
+      48,
+      49,
+      47,
+      48,
+      48,
+      52,
+      50,
+      49,
+      50
+    ],
+    "timestamp": 1787460687.2311432
+  },
+  {
+    "step": 740000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 69.1,
+    "raw_time_to_success": [
+      69,
+      67,
+      67,
+      79,
+      71,
+      66,
+      103,
+      56,
+      53,
+      60
+    ],
+    "timestamp": 1787460889.3382154
+  },
+  {
+    "step": 750000,
+    "success_rate": 1.0,
+    "mean_time_to_success": 53.5,
+    "raw_time_to_success": [
+      48,
+      72,
+      48,
+      50,
+      46,
+      55,
+      52,
+      50,
+      53,
+      61
+    ],
+    "timestamp": 1787461093.1910224
+  }
+]
