@@ -90,16 +90,17 @@ def build_targets(method, bootstrap_fn, rows, y_all, next_obs_n_all, is_terminal
         target = np.zeros(len(rows), dtype=np.float32)
         eps = episode_ids_all[rows]
         frames = frame_idxs_all[rows]
-        # Group episodes by sorting once instead of scanning the whole array
-        # per episode. The previous version called np.flatnonzero(eps == ep)
-        # inside a loop over every unique episode, which is O(n_episodes * n_rows)
-        # and became the dominant cost once the dataset grew past ~100k rows.
+        
         order = np.lexsort((frames, eps))
         ep_sorted = eps[order]
         boundaries = np.flatnonzero(np.diff(ep_sorted)) + 1
         for grp in np.split(order, boundaries):
             G_next = None
             for i in grp[::-1]:            # backwards through the episode
+                if truncated[i]:
+                    target[i] = 0.0
+                    G_next = None
+                    continue
                 if term[i]:
                     target[i] = term_val[i]
                 else:

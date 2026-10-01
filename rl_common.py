@@ -8,34 +8,16 @@ One copy here means a fix to eval logic never needs to be applied twice.
 import json
 import os
 import time
-
+import torch
 import numpy as np
+from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback
 
 from config import SUCCESS_KEY, RL_GAMMA
+from progress import compute_progress_metrics
 
 
 class SuccessRateCallback(BaseCallback):
-    """
-    Periodically: (a) checkpoints the model, (b) runs `n_eval_episodes` on
-    `eval_env` and records success rate + mean time-to-success against the
-    REAL success flag (not any shaped/predicted reward), appending to
-    `eval_history.json` in ckpt_dir.
-
-    `eval_env` must be a single (non-vectorized) gym.Env exposing `.reset()`
-    / `.step()` and `info["success"]`.
-
-    EVAL EPISODES ARE STOCHASTIC ON PURPOSE. This used to call
-    `eval_env.reset()` with no seed and `model.predict(deterministic=True)`.
-    The scene is pinned (make_fixed_scene_env disables task resampling) and
-    MuJoCo is deterministic, so all three sources of variation were gone:
-    every one of `n_eval_episodes` was bit-identical. success_rate could only
-    ever be 0.0 or 1.0, and every progress metric had exactly zero spread —
-    the same defect dataset_audit.check_trajectory_uniqueness caught in the
-    dataset (222 episodes -> 93 unique). n_eval_episodes=3 was paying 3x for
-    one number. Now each episode gets its own reset seed and samples the
-    policy, so the mean is an average over genuinely different rollouts.
-    """
 
     def __init__(self, eval_env, ckpt_dir, eval_freq=10_000, n_eval_episodes=10,
                  ckpt_freq=100_000, max_ep_steps=500, ckpt_prefix="policy",
@@ -48,8 +30,6 @@ class SuccessRateCallback(BaseCallback):
         self.ckpt_freq = ckpt_freq
         self.max_ep_steps = max_ep_steps
         self.ckpt_prefix = ckpt_prefix
-        # eval seeds live in a block far from any training/collection seed so
-        # they can never coincide with a trajectory the model was fit on
         self.eval_seed_base = eval_seed_base
         self.eval_deterministic = eval_deterministic
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -69,27 +49,61 @@ class SuccessRateCallback(BaseCallback):
         onset) so runs that all score 0% success can still be ranked — see
         progress.py for why cumulative shaped reward cannot serve this role.
         """
-        from progress import compute_progress_metrics
+  
 
+        # Seeding torch for a reproducible eval used to LEAVE the global RNG
+        # reseeded, so every eval silently reset SAC's exploration stream and
+        # changed the training run it was supposed to be observing. Save and
+        # restore around the episode.
+        rng_state = torch.get_rng_state()
         obs, _ = self.eval_env.reset(seed=seed)
         if not self.eval_deterministic:
             # the policy's own sampling is the only source of episode-to-episode
             # variation on a pinned scene, so seed it explicitly to keep the
             # eval reproducible across runs while still varying within a run
-            import torch
             torch.manual_seed(seed)
         obs_list, success_step = [], None
+        preds, rewards = [], []
         for t in range(self.max_ep_steps):
             obs_list.append(np.asarray(obs, dtype=np.float32).copy())
             action, _ = self.model.predict(obs, deterministic=self.eval_deterministic)
             obs, _reward, terminated, truncated, info = self.eval_env.step(action)
+            # Time2SuccessRewardWrapper publishes these and nothing was reading
+            # them. They are the only in-training view of the REWARD ITSELF:
+            # success_rate says whether the task was solved, these say what the
+            # policy was being paid while it wasn't.
+            if "t2s_pred" in info:
+                preds.append(float(info["t2s_pred"]))
+            if "t2s_reward" in info:
+                rewards.append(float(info["t2s_reward"]))
             if info.get(SUCCESS_KEY, 0) and success_step is None:
                 success_step = t + 1        # the state AFTER this step is the successful one
             if terminated or truncated:
                 break
+        torch.set_rng_state(rng_state)      # training continues undisturbed
         # record the final state so index success_step always exists
         obs_list.append(np.asarray(obs, dtype=np.float32).copy())
-        return success_step, compute_progress_metrics(np.array(obs_list), success_step)
+        m = compute_progress_metrics(np.array(obs_list), success_step)
+        if preds:
+            p = np.asarray(preds)
+            m["t2s_pred_min"] = float(p.min())
+            m["t2s_pred_final"] = float(p[-1])
+            # THE false-optimism detector, live: the policy reached a state the
+            # model scores as nearly solved, and then did not solve it. This is
+            # the empty-gripper hover as a number, during training, without
+            # waiting for a video.
+            m["false_optimism"] = float(p.min()) if success_step is None else None
+        if rewards:
+            r = np.asarray(rewards)
+            m["reward_mean"] = float(r.mean())
+            m["reward_total"] = float(r.sum())
+            # share of steps paying >= 0 while the episode never succeeds: the
+            # policy being paid to do something that does not work
+            m["reward_nonneg_frac"] = (float(np.mean(r >= 0))
+                                       if success_step is None else None)
+            # no gradient on these steps
+            m["dead_step_frac"] = float(np.mean(np.abs(r) < 1e-3))
+        return success_step, m
 
     def _on_step(self) -> bool:
         # Use num_timesteps (total ENVIRONMENT steps across all parallel envs),
@@ -122,7 +136,11 @@ class SuccessRateCallback(BaseCallback):
             for key in ("mean_min_hand_peg_distance", "best_min_hand_peg_distance",
                         "mean_min_peg_goal_distance", "best_min_peg_goal_distance",
                         "mean_final_peg_goal_distance", "peg_moved_rate",
-                        "control_rate", "mean_obs_movement"):
+                        "control_rate", "mean_obs_movement",
+                        # the reward's own behaviour during training
+                        "mean_t2s_pred_min", "mean_false_optimism",
+                        "mean_reward_mean", "mean_reward_nonneg_frac",
+                        "mean_dead_step_frac"):
                 if progress.get(key) is not None:
                     self.logger.record(f"eval/{key}", progress[key])
 
@@ -147,6 +165,7 @@ class SuccessRateCallback(BaseCallback):
 def train_sac(train_env, eval_env, run_dir, total_timesteps, ckpt_prefix="policy",
               eval_freq=10_000, ckpt_freq=100_000, n_eval_episodes=10,
               smoke_test_steps=5_000, seed=0, sac_kwargs=None, tb_subdir="tb",
+              smoke_counts_toward_total=True,
               gamma=RL_GAMMA, n_eval_seeds_base=10_000):
     """
     Generic SAC training loop: smoke test, then full run, saving into run_dir.
@@ -159,11 +178,12 @@ def train_sac(train_env, eval_env, run_dir, total_timesteps, ckpt_prefix="policy
     `sac_kwargs.update()` silently let a caller change SAC's discount while
     the shaping term and the return statistics kept the old one.
     """
-    from stable_baselines3 import SAC
+    
 
     resolved_kwargs = dict(
         policy="MlpPolicy", learning_rate=3e-4, buffer_size=1_000_000,
         batch_size=256, tau=0.005, ent_coef="auto",
+        train_freq=1, gradient_steps=1,
         policy_kwargs=dict(net_arch=[400, 400]),
     )
     resolved_kwargs.update(sac_kwargs or {})
@@ -188,7 +208,12 @@ def train_sac(train_env, eval_env, run_dir, total_timesteps, ckpt_prefix="policy
                                   n_eval_episodes=n_eval_episodes, ckpt_freq=ckpt_freq,
                                   ckpt_prefix=ckpt_prefix, eval_seed_base=n_eval_seeds_base,
                                   verbose=1)
-    model.learn(total_timesteps=total_timesteps, callback=main_cb,
+    # reset_num_timesteps=False continues the counter, so a 3k smoke test plus
+    # a 400k main run reported 403k. Subtract it so "400k" means 400k and two
+    # runs with different smoke settings stay comparable.
+    main_steps = (max(total_timesteps - (smoke_test_steps or 0), 1)
+                  if smoke_counts_toward_total else total_timesteps)
+    model.learn(total_timesteps=main_steps, callback=main_cb,
                 tb_log_name="train", reset_num_timesteps=False)
 
     model.save(os.path.join(run_dir, f"{ckpt_prefix}_final"))
