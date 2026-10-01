@@ -75,7 +75,7 @@ def parse_args(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--drive", default="retreat",
                    help="'move:steps,...' or a preset: " + ", ".join(sorted(PRESETS)))
-    p.add_argument("--t2s-run", default="v8", help="t2s_model run name")
+    p.add_argument("--t2s-run", default="v9", help="t2s_model run name")
     p.add_argument("--models", nargs="+", default=None,
                    help="combo names to score (default: all in the run)")
     p.add_argument("--takeover", default="success", choices=["success", "failure"],

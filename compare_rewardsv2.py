@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Compare the T2S prediction with MetaWorld's reward over time, on many trajectories.
+Does the T2S reward move with MetaWorld's reward on the same trajectories?
 
-    python compare_rewards.py --t2s-run v6 --models tdlambdaboot_all
-    python compare_rewards.py --t2s-run v6 --models tdlambdaboot_all td0boot_all --episodes 15
+    python compare_rewards.py --t2s-run v5 --models tdlambdaboot_succ td0boot_all
+    python compare_rewards.py --t2s-run v5 --models td0boot_all --reward-mode absolute
+    python compare_rewards.py --t2s-run v5 --models td0boot_all --seed-index 1
 
-Trajectories are live rollouts of the two Stage 3 evaluation policies, grouped by
-whether the episode succeeded. Every measure is computed on each trajectory
-separately, then averaged over the successful and over the failed trajectories.
+One trajectory per kind (--seed-index picks which), one plot each. Spearman between the T2S reward the policy is paid
+(for --reward-mode) and the matching MetaWorld quantity:
+
+    absolute                  -T2S(s')            vs  MetaWorld reward        (both levels)
+    difference(_timed)        T2S(s)-g*T2S(s')    vs  change in MetaWorld     (both per-step changes)
+
+The time penalty is a constant shift, so it does not change Spearman.
 """
 import argparse
 import json
@@ -17,292 +22,194 @@ import sys
 import numpy as np
 from scipy.stats import spearmanr
 
-import config
-import results
-from stable_baselines3 import SAC
-from t2s_model import load_t2s_predictor
-import torch
-from env_utils import make_fixed_scene_env
-
-import matplotlib
-  
-import matplotlib.pyplot as plt
-
-
-# ---- settings you may want to change ----------------------------------------
-WINDOW_SIZES = (1, 5, 10, 20)   # compare changes over this many steps
-MAX_SHIFT = 15                  # largest time shift (steps) tried when aligning the two series
-BOOTSTRAP_SAMPLES = 2000        # used for the 95% range of each average
 STAGE_MANIFEST = "stage_manifest.json"
+MW_STAGES = ("near_object", "grasp_success", "grasp_reward", "in_place_reward")
+STAGE_COLORS = ("tab:purple", "tab:red", "tab:brown", "tab:pink")
 
 
-# ---- 1. collecting trajectories ----------------------------------------------
-def rollout(policy, seed, max_steps, steps_after_success, success_key):
-    """One episode with sampled actions. Returns observations, MetaWorld rewards, success step."""
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Spearman: T2S reward vs MetaWorld reward",
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--t2s-run", required=True)
+    p.add_argument("--models", nargs="+", required=True)
+    p.add_argument("--data-run", default=None, help="default: the T2S run's data run")
+    p.add_argument("--kinds", nargs="+", default=["clean_success", "clean_failure",
+                                                  "perturbed_recovery", "perturbed_failure"])
+    p.add_argument("--seed-index", type=int, default=1,
+                   help="which stored trajectory of each kind to check (0 = first)")
+    p.add_argument("--reward-mode", default="difference_timed",
+                   choices=["absolute", "difference", "difference_timed"])
+    p.add_argument("--gamma", type=float, default=None, help="default: config.RL_GAMMA")
+    p.add_argument("--time-penalty", type=float, default=None, help="default: config.TIME_PENALTY")
+    return p.parse_args(argv)
+
+
+def reroll(policy, seed, perturb):
+    """Replay a stored reference with data_collection's seeding, recording MetaWorld's reward and stages."""
+    import torch
+    from config import MAX_STEPS, SUCCESS_KEY, REFERENCE_TAIL
+    from env_utils import make_fixed_scene_env
 
     env = make_fixed_scene_env()
     torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
     obs, _ = env.reset(seed=seed)
-    observations, rewards, success_step = [np.asarray(obs, np.float32)], [], None
-    for t in range(max_steps):
-        action, _ = policy.predict(obs, deterministic=False)
-        obs, reward, terminated, truncated, info = env.step(action)
-        observations.append(np.asarray(obs, np.float32))
-        rewards.append(float(reward))              # rewards[i] belongs to observations[i + 1]
-        if info.get(success_key, 0) and success_step is None:
-            success_step = t + 1
-        if terminated or truncated or (success_step is not None
-                                       and t >= success_step + steps_after_success):
+    O, R, S, ss = [], [], [], None
+    for t in range(MAX_STEPS):
+        O.append(np.asarray(obs, dtype=np.float32).copy())
+        if t < perturb:
+            a = rng.uniform(env.action_space.low, env.action_space.high)
+        else:
+            a, _ = policy.predict(obs, deterministic=False)
+        obs, r, term, trunc, info = env.step(a)
+        R.append(float(r))
+        S.append({k: float(info[k]) for k in MW_STAGES if k in info})
+        if info.get(SUCCESS_KEY, 0) and ss is None:
+            ss = t + 1
+        if term or trunc or (ss is not None and t >= ss + REFERENCE_TAIL):
             break
+    O.append(np.asarray(obs, dtype=np.float32).copy())
     env.close()
-    return np.array(observations), np.array(rewards), success_step
+    return np.array(O), np.array(R), S, ss
 
 
-def aligned_series(predictions, metaworld_rewards, success_step):
-    """
-    The two series compared, on the same time steps s_1 .. s_n, where n is the success
-    step (or the last step of a failed episode). T2S is negated so both rise with progress.
-    """
-    n = len(metaworld_rewards) if success_step is None else min(success_step, len(metaworld_rewards))
-    t2s_progress = -np.asarray(predictions[1:n + 1], float)
-    metaworld = np.asarray(metaworld_rewards[:n], float)
-    return t2s_progress, metaworld
+def reward_rho(pred, mw_r, ss, reward_mode, gamma, tp):
+    """(rho, x, y): Spearman between the T2S reward x and MetaWorld's y, up to success."""
+    from reward_fn import step_reward
+
+    n = len(mw_r) if ss is None else min(ss, len(mw_r))     # transition i: s_i -> s_{i+1}
+    nxt = pred[1:n + 1].copy()
+    if ss is not None and ss <= n:
+        nxt[ss - 1] = 0.0                                   # the wrapper's terminal value
+    t2s = np.array([step_reward(pred[i], nxt[i], reward_mode=reward_mode,
+                                time_penalty=tp, gamma=gamma) for i in range(n)])
+    if reward_mode == "absolute":
+        x, y = t2s, mw_r[:n]                                # levels at s_{i+1}
+    else:
+        x, y = t2s[1:], np.diff(mw_r[:n])                   # changes s_i -> s_{i+1}, i >= 1
+    if len(x) < 3 or np.std(x) == 0 or np.std(y) == 0:
+        return None, x, y
+    return float(spearmanr(x, y)[0]), x, y
 
 
-# ---- 2. measures on one trajectory -------------------------------------------
-
-def correlation(a, b):
-    """Spearman correlation, or None when either series is constant or too short."""
-    a, b = np.asarray(a, float), np.asarray(b, float)
-    if len(a) < 3 or a.std() == 0 or b.std() == 0:
-        return None
-    return float(spearmanr(a, b)[0])
-
-
-def remove_time_trend(x):
-    """x minus its best straight-line fit against time."""
-    t = np.arange(len(x))
-    slope, intercept = np.polyfit(t, x, 1)
-    return x - (slope * t + intercept)
-
-
-def best_time_shift(t2s_progress, metaworld):
-    """Shift (steps) with the highest correlation. Positive: T2S changes before MetaWorld."""
-    best_value, best_shift = None, None
-    for shift in range(-MAX_SHIFT, MAX_SHIFT + 1):
-        if shift >= 0:
-            a, b = t2s_progress[:len(t2s_progress) - shift], metaworld[shift:]
-        else:
-            a, b = t2s_progress[-shift:], metaworld[:len(metaworld) + shift]
-        value = correlation(a, b)
-        if value is not None and (best_value is None or value > best_value):
-            best_value, best_shift = value, shift
-    return best_shift
-
-def cross_correlation(t2s_progress, metaworld, window=CROSS_CORRELATION_WINDOW,
-                      max_shift=MAX_SHIFT):
-    """
-    Correlation between the two series' changes at every time shift.
-    Returns a list over shifts -max_shift .. +max_shift (None where undefined).
-    Positive shift: T2S's change is compared with MetaWorld's change that many steps later.
-    """
-    
-    dx = t2s_progress[window:] - t2s_progress[:-window]
-    dy = metaworld[window:] - metaworld[:-window]
-    curve = []
-    for shift in range(-max_shift, max_shift + 1):
-        if shift >= 0:
-            a, b = dx[:len(dx) - shift], dy[shift:]
-        else:
-            a, b = dx[-shift:], dy[:len(dy) + shift]
-        curve.append(correlation(a, b))
-    return curve
-
-def trajectory_measures(t2s_progress, metaworld):
-    """Every per-trajectory measure, by readable name. Add or remove entries here."""
-    n = len(t2s_progress)
-    measures = {
-        "Correlation of levels": correlation(t2s_progress, metaworld),
-        "Correlation of levels, time trend removed": (
-            correlation(remove_time_trend(t2s_progress), remove_time_trend(metaworld))
-            if n >= 3 else None),
-    }
-    for k in WINDOW_SIZES:
-        measures[f"Correlation of changes over {k} step{'s' if k > 1 else ''}"] = (
-            correlation(t2s_progress[k:] - t2s_progress[:-k], metaworld[k:] - metaworld[:-k])
-            if n > k + 2 else None)
-    measures["Time shift with the best agreement (steps)"] = (
-        best_time_shift(remove_time_trend(t2s_progress), remove_time_trend(metaworld))
-        if n >= 3 else None)
-    return measures
-
-
-# ---- 3. averaging over trajectories ------------------------------------------
-
-def average_with_range(values):
-    """Mean and 95% bootstrap range over trajectories (each trajectory counts once)."""
-    v = np.array([x for x in values if x is not None], float)
-    if len(v) == 0:
-        return None, None, None
-    if len(v) == 1:
-        return float(v[0]), None, None
-    means = np.random.default_rng(0).choice(v, (BOOTSTRAP_SAMPLES, len(v))).mean(axis=1)
-    return float(v.mean()), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
-
-
-def as_text(result, decimals=2):
-    mean, low, high = result
-    if mean is None:
-        return "not available"
-    text = f"{mean:.{decimals}f}"
-    if low is not None:
-        text += f"  ({low:.{decimals}f} to {high:.{decimals}f})"
-    return text
-
-
-# ---- 4. plots ----------------------------------------------------------------
-
-def plot_example(title, predictions, metaworld_rewards, success_step, path):
-    """One trajectory: T2S prediction and MetaWorld reward over time."""
-    matplotlib.use("Agg")
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(np.arange(len(predictions)), predictions, color="tab:orange", lw=2,
-            label="T2S prediction (steps to success)")
-    ax.set_xlabel("step"); ax.set_ylabel("T2S prediction", color="tab:orange")
-    ax2 = ax.twinx()
-    ax2.plot(np.arange(1, len(metaworld_rewards) + 1), metaworld_rewards, color="black", lw=1.5,
-             label="MetaWorld reward")
-    ax2.set_ylabel("MetaWorld reward")
-    if success_step is not None:
-        ax.axvline(success_step, color="tab:green", ls=":", label=f"success at step {success_step}")
-    handles = ax.get_legend_handles_labels()[0] + ax2.get_legend_handles_labels()[0]
-    ax.legend(handles=handles, fontsize=8, loc="center right")
-    ax.grid(alpha=0.3)
-    ax.set_title(title, fontsize=10)
-    fig.tight_layout()
-    fig.savefig(path, dpi=140)
-    plt.close(fig)
-
-
-def plot_summary(summary, names, path):
-    """Each correlation measure: average over successful vs failed trajectories, per model."""
+def plot_one(title, pred, mw_r, stages, ss, rho, x, y, reward_mode, path):
+    """Left: the correlation. Right: MetaWorld's reward stages against the T2S prediction."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(11, 0.5 * len(names) * len(summary) + 2))
-    y, labels = 0, []
-    for model, per_outcome in summary.items():
-        for name in names:
-            for offset, (outcome, color) in enumerate((("successful", "tab:green"),
-                                                       ("failed", "tab:red"))):
-                mean, low, high = per_outcome[outcome][name]
-                if mean is not None:
-                    err = [[mean - (low if low is not None else mean)],
-                           [(high if high is not None else mean) - mean]]
-                    ax.errorbar(mean, y + 0.2 * offset, xerr=err, fmt="o", color=color,
-                                capsize=3, label=outcome if y == 0 else None)
-            labels.append(f"{model}: {name}")
-            y += 1
-    ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels, fontsize=8)
-    ax.invert_yaxis()
-    ax.axvline(0, color="0.6", lw=0.8)
-    ax.set_xlim(-1, 1); ax.set_xlabel("Spearman correlation (mean and 95% range)")
-    ax.legend(fontsize=8); ax.grid(alpha=0.3, axis="x")
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 4.8))
+    a1.scatter(x, y, s=14, alpha=0.6, color="tab:orange", edgecolors="none")
+    if len(x) >= 2 and np.std(x) > 0:
+        k, b = np.polyfit(x, y, 1)
+        xx = np.linspace(np.min(x), np.max(x), 50)
+        a1.plot(xx, k * xx + b, color="black", lw=1.2)
+    a1.text(0.03, 0.97, f"Spearman \u03c1 = {'--' if rho is None else f'{rho:+.2f}'}   n = {len(x)}",
+            transform=a1.transAxes, va="top", fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="0.8"))
+    if reward_mode == "absolute":
+        a1.set_xlabel("T2S reward  -T2S(s')"); a1.set_ylabel("MetaWorld reward")
+    else:
+        a1.set_xlabel(f"T2S reward ({reward_mode})"); a1.set_ylabel("\u0394 MetaWorld reward")
+    a1.set_title("Correlation (transitions up to success)", fontsize=10)
+    a1.grid(alpha=0.25)
+
+    t = np.arange(1, len(mw_r) + 1)                         # stage values describe s_{i+1}
+    lines = []
+    for k, c in zip(MW_STAGES, STAGE_COLORS):
+        vals = [d.get(k, np.nan) for d in stages]
+        if not np.all(np.isnan(vals)):
+            lines += a2.plot(t, vals, color=c, lw=1.4, label=k)
+    a2.set_ylabel("MetaWorld stage value")
+    a2.set_xlabel("step")
+    a3 = a2.twinx()
+    lines += a3.plot(np.arange(len(pred)), pred, color="tab:orange", lw=2, ls="--",
+                     label="T2S prediction")
+    a3.set_ylabel("T2S predicted steps", color="tab:orange")
+    if ss is not None:
+        lines.append(a2.axvline(ss, color="tab:green", ls=":", lw=1.5, label=f"success @ {ss}"))
+    a2.legend(handles=lines, fontsize=7, loc="center right")
+    a2.set_title("MetaWorld reward stages vs T2S prediction", fontsize=10)
+    a2.grid(alpha=0.25)
+
+    fig.suptitle(title, fontsize=11)
     fig.tight_layout()
-    fig.savefig(path, dpi=140)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
-# ---- 5. main -----------------------------------------------------------------
-
 def main(argv=None):
-    p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--t2s-run", required=True)
-    p.add_argument("--models", nargs="+", required=True)
-    p.add_argument("--eval-run", default=None, help="t2s_eval run holding the policies (default: --t2s-run)")
-    p.add_argument("--episodes", type=int, default=10, help="episodes per evaluation policy")
-    p.add_argument("--first-seed", type=int, default=500)
-    args = p.parse_args(argv)
+    args = parse_args(argv)
 
+    import config
+    import results
+    from stable_baselines3 import SAC
+    from t2s_model import load_t2s_predictor
 
+    gamma = config.RL_GAMMA if args.gamma is None else args.gamma
+    tp = config.TIME_PENALTY if args.time_penalty is None else args.time_penalty
 
     t2s_dir = results.get_run_dir("t2s_model", args.t2s_run)
-    combos = json.load(open(os.path.join(t2s_dir, "manifest.json")))["combos"]
-    predictors = {m: load_t2s_predictor(t2s_dir, *m.rsplit("_", 1),
-                                        seed=combos[m].get("best_seed", 0)) for m in args.models}
+    with open(os.path.join(t2s_dir, "manifest.json")) as f:
+        combos = json.load(f)["combos"]
+    missing = [m for m in args.models if m not in combos]
+    if missing:
+        raise SystemExit(f"ERROR: {missing} not in {args.t2s_run}; available: {sorted(combos)}")
+    fns = {m: load_t2s_predictor(t2s_dir, *m.rsplit("_", 1), seed=combos[m].get("best_seed", 0))
+           for m in args.models}
 
-    eval_dir = results.get_run_dir("t2s_eval", args.eval_run or args.t2s_run)
-    stage3 = json.load(open(os.path.join(eval_dir, STAGE_MANIFEST)))
-    policies = {k: SAC.load(os.path.join(config.EXPERT_POLICY_DIR, stage3[f"{k}_ckpt"]))
-                for k in ("success", "failure")}
+    data_run = args.data_run
+    if data_run is None:
+        with open(os.path.join(t2s_dir, STAGE_MANIFEST)) as f:
+            data_run = json.load(f)["data_run"]
+    ref_dir = os.path.join(results.get_run_dir("data_collection", data_run), "references")
+    with open(os.path.join(ref_dir, "index.json")) as f:
+        index = json.load(f)
+    pols = {k: SAC.load(os.path.join(config.EXPERT_POLICY_DIR, index[f"{k}_ckpt"]))
+            for k in ("success", "failure")}
 
-    trajectories = []
-    for policy in policies.values():
-        for seed in range(args.first_seed, args.first_seed + args.episodes):
-            obs, rewards, success_step = rollout(policy, seed, config.MAX_STEPS,
-                                                 config.REFERENCE_TAIL, config.SUCCESS_KEY)
-            trajectories.append(dict(seed=seed, obs=obs, rewards=rewards,
-                                     success_step=success_step))
-    n_success = sum(t["success_step"] is not None for t in trajectories)
-    print(f"{len(trajectories)} episodes: {n_success} successful, "
-          f"{len(trajectories) - n_success} failed\n")
+    out = os.path.join(ref_dir, "reward_compare")
+    print(f"=== T2S vs MetaWorld: reward_mode={args.reward_mode}  gamma={gamma} ===\n")
+    rows = []
+    for kind in args.kinds:
+        cands = [r for r in index["trajectories"] if r["kind"] == kind]
+        if not cands:
+            print(f"  {kind}: no stored reference")
+            continue
+        for ref in [cands[min(args.seed_index, len(cands) - 1)]]:
+            obs, mw_r, stages, ss = reroll(pols[ref["policy"]], ref["seed"], ref["perturb_steps"])
+            stored = np.load(os.path.join(ref_dir, ref["name"] + ".npz"))["obs"]
+            match = len(stored) == len(obs) and np.allclose(stored, obs, atol=1e-4)
+            for m, fn in fns.items():
+                pred = np.array([fn(o) for o in obs], dtype=float)
+                rho, x, y = reward_rho(pred, mw_r, ss, args.reward_mode, gamma, tp)
+                os.makedirs(os.path.join(out, m), exist_ok=True)
+                plot_one(f"{m}  |  {ref['name']}  |  {args.reward_mode}"
+                         + ("" if match else "  (replay diverged)"),
+                         pred, mw_r, stages, ss, rho, x, y, args.reward_mode,
+                         os.path.join(out, m, f"{ref['name']}_{args.reward_mode}.png"))
+                rows.append(dict(model=m, kind=kind, name=ref["name"], success=ss is not None,
+                                 rho=rho, n=len(x), replay_match=bool(match)))
 
-    out_dir = os.path.join(eval_dir, "reward_compare")
-    os.makedirs(out_dir, exist_ok=True)
-    summary, all_rows = {}, []
-    
-    for model, predict in predictors.items():
-        rows = []
-        for t in trajectories:
-            predictions = np.array([predict(o) for o in t["obs"]], float)
-            outcome = "successful" if t["success_step"] is not None else "failed"
-            t2s_progress, metaworld = aligned_series(predictions, t["rewards"], t["success_step"])
-            n = len(metaworld)
-            
-            row = dict(model=model, seed=t["seed"], outcome=outcome,
-                       **trajectory_measures(t2s_progress, metaworld))
-            row["Prediction at the start"] = float(predictions[0])
-            row["Prediction at the end"] = float(predictions[n])
-            row["MetaWorld reward at the end"] = float(metaworld[-1])
-            row["cross correlation"] = cross_correlation(t2s_progress, metaworld)            
-            rows.append(row)
-            
-            if not any(r["outcome"] == outcome for r in rows[:-1]):
-                plot_example(f"{model}, {outcome} episode (seed {t['seed']})", predictions,
-                             t["rewards"], t["success_step"],
-                             os.path.join(out_dir, f"{model}_{outcome}_example.png"))
-        all_rows += rows
+    f = lambda v: "--" if v is None else f"{v:+.2f}"
+    print(f"{'model':<22}{'trajectory':<32}{'rho':>7}{'n':>6}")
+    print("-" * 67)
+    for r in rows:
+        print(f"{r['model']:<22}{r['name']:<32}{f(r['rho']):>7}{r['n']:>6}"
+              + ("" if r["replay_match"] else "  (replay diverged)"))
 
-        names = [k for k in rows[0] if k not in ("model", "seed", "outcome", "cross correlation")]
-        summary[model] = {o: {name: average_with_range([r[name] for r in rows if r["outcome"] == o])
-                              for name in names} for o in ("successful", "failed")}
-        counts = {o: sum(r["outcome"] == o for r in rows) for o in ("successful", "failed")}
+    mean = lambda m, s: (lambda v: float(np.mean(v)) if v else None)(
+        [r["rho"] for r in rows if r["model"] == m and r["success"] == s and r["rho"] is not None])
+    print(f"\n{'model':<22}{'rho succ':>10}{'rho fail':>10}")
+    print("-" * 42)
+    for m in fns:
+        print(f"{m:<22}{f(mean(m, True)):>10}{f(mean(m, False)):>10}")
 
-        print(f"Model {model}")
-        print(f"  {'':<48}{'successful (' + str(counts['successful']) + ')':<30}"
-              f"{'failed (' + str(counts['failed']) + ')':<30}")
-        
-        for name in names:
-            decimals = 2 if name.startswith("Correlation") else 1
-            print(f"  {name:<48}{as_text(summary[model]['successful'][name], decimals):<30}"
-                  f"{as_text(summary[model]['failed'][name], decimals):<30}")
-            
-        for o in ("successful", "failed"):
-            rs = [r for r in rows if r["outcome"] == o]
-            across = correlation([r["Prediction at the start"] - r["Prediction at the end"] for r in rs],
-                                 [r["MetaWorld reward at the end"] for r in rs])
-            summary[model][o]["Correlation across episodes"] = across
-            print(f"  Across {o} episodes, correlation between the T2S prediction's drop and "
-                  f"MetaWorld's final reward: "
-                  f"{'not available' if across is None else format(across, '.2f')}")
-        print()
-
-    correlation_names = [n for n in names if n.startswith("Correlation")]
-    plot_summary(summary, correlation_names, os.path.join(out_dir, "summary.png"))
-    json.dump(dict(t2s_run=args.t2s_run, summary=summary, trajectories=all_rows),
-              open(os.path.join(out_dir, "compare.json"), "w"), indent=2)
-    print(f"wrote {out_dir}: compare.json, summary.png, and one example plot per model and outcome")
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, f"spearman_{args.reward_mode}.json"), "w") as fh:
+        json.dump(dict(t2s_run=args.t2s_run, reward_mode=args.reward_mode, gamma=gamma,
+                       rows=rows), fh, indent=2)
+    print(f"\nwrote {out}/spearman_{args.reward_mode}.json and plots in {out}/<model>/")
     return 0
 
 
