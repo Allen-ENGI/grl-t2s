@@ -19,6 +19,13 @@ import results
 import t2s_video
 from t2s_model import load_t2s_predictor
 
+import torch
+
+from config import SUCCESS_KEY
+from env_utils import make_fixed_scene_env
+from t2s_video import render_frame
+
+from scene_edit import reset_with_peg_offset
 
 # MetaWorld action: [dx, dy, dz, gripper], each in [-1, 1]
 MOVES = {
@@ -117,6 +124,11 @@ def parse_args(argv=None):
                         "still yields a pred@handover vs actual-steps comparison.")
     p.add_argument("--probe", action="store_true",
                    help="print distances after the drive and exit; no rendering")
+    
+    p.add_argument("--peg-offset", type=float, nargs=3, default=[0, 0, 0], metavar=("DX", "DY", "DZ"),
+                   help="move the peg's start by this much, in cm, relative to the fixed scene")
+    
+    
     return p.parse_args(argv)
 
 
@@ -127,7 +139,7 @@ def scale_drive(drive, factor):
 
 
 def drive_then_policy(policy, drive, seed=0, max_steps=500, stop_after_success=20,
-                      deterministic=True):
+                      deterministic=True, peg_offset=[0, 0, 0]):
     """
     Run the scripted drive, then hand control to `policy`. Returns a rollout
     dict plus `handover` (the frame index where the policy took over) and
@@ -137,16 +149,14 @@ def drive_then_policy(policy, drive, seed=0, max_steps=500, stop_after_success=2
     successful. It is reported RELATIVE TO THE START, so `success_step -
     handover` is what the policy actually took from the pose it inherited.
     """
-    import torch
-
-    from config import SUCCESS_KEY
-    from env_utils import make_fixed_scene_env
-    from t2s_video import render_frame
-
+    
     env = make_fixed_scene_env(render_mode="rgb_array")
     torch.manual_seed(seed)
     np.random.seed(seed)
+    
     obs, _ = env.reset(seed=seed)
+    obs = reset_with_peg_offset(env, seed, np.asarray(peg_offset) / 100)
+    # obs = move_peg(env, np.asarray(peg_offset) / 100)
 
     obs_list, frames, phases = [], [], []
     success_step = None
@@ -317,7 +327,7 @@ def main(argv=None):
 
     # ---- roll ONCE; every model scores the same frames -------------------
     roll = drive_then_policy(policy, drive, seed=args.seed, max_steps=args.max_steps,
-                             deterministic=args.deterministic)
+                             deterministic=args.deterministic, peg_offset=args.peg_offset)
     from progress import hand_peg_distance, peg_goal_distance
     ho = roll["handover"]
     o0, oh = roll["obs"][0], roll["obs"][min(ho, len(roll["obs"]) - 1)]
