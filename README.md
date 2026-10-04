@@ -16,3 +16,10 @@ run_4_policy - downstream RL training
     reward_fn: the scripte store all rewards
     policy_train
     
+
+
+New added scriptes for adjust peg initial positions:
+
+peg_range - check the range of expert policy to succed with different peg location
+scene_edit - funciton that modify the peg location
+t2s_attribution - analyze how different element in the dataset matrix impact the t2s predicition

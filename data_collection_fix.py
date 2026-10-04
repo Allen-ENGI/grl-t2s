@@ -4,26 +4,16 @@ Stage 2: Time2Success data collection.
     from data_collection import collect
     collect(run_dir, holdout=["..._200000.zip"])
 
-Data comes only from the expert checkpoints, each rolled as-is with the policy
-sampled (deterministic=False). No action noise is injected: every episode is
-labelled with the time-to-success of a real policy. Failed episodes come from
-weak checkpoints, which are verified by probing before collection starts.
-
-Peg starts are RANDOMISED for this data (T2S training only): each episode starts
-either at the fixed-scene peg position (FIXED_START_SHARE of episodes) or at one of
-NUM_PEG_POSITIONS random positions in PEG_X_RANGE x PEG_Y_RANGE. The box and hole
-never move. Downstream RL is unchanged and keeps the fixed scene.
-
-Train/val separation: a share of the random positions (VAL_POSITION_SHARE) is used
-ONLY for validation, so validation tests peg positions never seen in training.
-Fixed-start episodes are split as before (by episode, stratified, duplicate-safe).
+Data comes only from the expert checkpoints, each rolled as-is on the fixed
+scene with the policy sampled (deterministic=False). No action noise is
+injected: every episode is labelled with the time-to-success of a real policy.
+Failed episodes come from weak checkpoints, which are verified by probing
+before collection starts.
 """
 import glob
 import os
 import warnings
-
 import numpy as np
-
 from config import (HAND_POS_IDX, PEG_POS_IDX, SUCCESS_KEY, MAX_STEPS,
                     CENSOR_LABEL, EXPERT_POLICY_DIR, TASK_SLUG,
                     REFERENCE_SEEDS, REFERENCE_KINDS, PERTURB_STEPS,
@@ -37,22 +27,11 @@ COLLECTION_SEED_BLOCK = 100_000
 DEFAULT_VAL_FRACTION = 0.2
 SPLITS = ("train", "val")
 
-# =============================================================================
-# RANDOM PEG STARTS (T2S data only; downstream RL keeps the fixed scene)
-NUM_PEG_POSITIONS = 200          # <<< number of distinct random peg start positions
-PEG_X_RANGE = (-0.10, 0.30)      # metres, from the peg_range map
-PEG_Y_RANGE = (0.40, 0.80)       # metres
-FIXED_START_SHARE = 0.25         # share of episodes kept at the fixed-scene peg start
-VAL_POSITION_SHARE = 0.2         # share of the random positions used ONLY for validation
-PEG_POSITION_SEED = 12345        # the position pool is the same in every collection run
-# =============================================================================
-
 VEL_WINDOW, VEL_COS_THRESH, VEL_MIN_MOTION = 5, 0.7, 3e-4
 POSE_WINDOW, POSE_STD_THRESH, CONFIRM_FRAMES = 5, 2e-3, 2
 
 
 # ---- control-onset detection --------------------------------------------
-
 def coupling_signals(obs_seq):
     hand, peg = obs_seq[:, HAND_POS_IDX], obs_seq[:, PEG_POS_IDX]
     T = len(obs_seq)
@@ -146,14 +125,9 @@ def assign_splits(episodes, val_fraction=DEFAULT_VAL_FRACTION, dedupe=True):
 
 # ---- rollout ------------------------------------------------------------
 
-def collect_episode(policy, env, seed=None, peg_offset=None):
-    """One episode with the policy sampled -> (obs_seq, flags, first_success).
-    peg_offset: (dx, dy, dz) in metres from the fixed-scene peg start, or None."""
-    if peg_offset is not None and np.any(peg_offset):
-        from scene_edit import reset_with_peg_offset
-        obs = reset_with_peg_offset(env, seed, peg_offset)
-    else:
-        obs, _ = env.reset(seed=seed)
+def collect_episode(policy, env, seed=None):
+    """One episode with the policy sampled -> (obs_seq, flags, first_success)."""
+    obs, _ = env.reset(seed=seed)
     obs_list, flags, first_success = [], [], None
     for t in range(MAX_STEPS):
         obs_list.append(np.asarray(obs, dtype=np.float32).copy())
@@ -166,38 +140,6 @@ def collect_episode(policy, env, seed=None, peg_offset=None):
             break
     obs_list.append(np.asarray(obs, dtype=np.float32).copy())
     return np.array(obs_list, dtype=np.float32), np.array(flags), first_success
-
-
-# ---- random peg positions ------------------------------------------------
-
-def peg_position_pool(n=NUM_PEG_POSITIONS, x_range=PEG_X_RANGE, y_range=PEG_Y_RANGE,
-                      val_share=VAL_POSITION_SHARE, seed=PEG_POSITION_SEED):
-    """(positions (n, 2), is_val (n,)): uniform random (x, y) peg starts; the first
-    round(val_share * n) of them are validation-only."""
-    rng = np.random.default_rng(seed)
-    xy = np.column_stack([rng.uniform(*x_range, n), rng.uniform(*y_range, n)])
-    is_val = np.zeros(n, bool)
-    is_val[:int(round(val_share * n))] = True
-    return xy, is_val
-
-
-def choose_position(rng, n_positions, fixed_share):
-    """-1 = the fixed-scene start, otherwise an index into the position pool."""
-    return -1 if rng.random() < fixed_share else int(rng.integers(n_positions))
-
-
-def assign_position_splits(episodes, pos_is_val, val_fraction):
-    """Random-position episodes: split by position. Fixed-start episodes: assign_splits."""
-    splits = np.empty(len(episodes), dtype=object)
-    fixed = [i for i, e in enumerate(episodes) if e["position_id"] < 0]
-    for i, e in enumerate(episodes):
-        if e["position_id"] >= 0:
-            splits[i] = "val" if pos_is_val[e["position_id"]] else "train"
-    info = {}
-    if fixed:
-        fixed_splits, info = assign_splits([episodes[i] for i in fixed], val_fraction=val_fraction)
-        splits[fixed] = fixed_splits
-    return splits, info
 
 
 # ---- checkpoint discovery -----------------------------------------------
@@ -344,14 +286,11 @@ def collect_references(run_dir, success_ckpt, failure_ckpt, expert_dir=EXPERT_PO
 
 def collect(run_dir, holdout=(), episodes=80, seeds=(0, 1, 2),
             val_fraction=DEFAULT_VAL_FRACTION, expert_dir=EXPERT_POLICY_DIR,
-            references=True, reference_policies=None, verbose=True,
-            peg_positions=NUM_PEG_POSITIONS, peg_x_range=PEG_X_RANGE, peg_y_range=PEG_Y_RANGE,
-            fixed_share=FIXED_START_SHARE, val_position_share=VAL_POSITION_SHARE):
+            references=True, reference_policies=None, verbose=True):
     """
-    Collect `episodes` per checkpoint per seed from every non-holdout checkpoint,
-    each starting at the fixed peg start or at a random position from the pool.
+    Collect `episodes` per checkpoint per seed from every non-holdout checkpoint.
     Writes dataset.npz (X, y_steps, episode_ids, frame_idxs, collection_seeds,
-    split, position_ids) and dataset_summary.json (including the position pool).
+    split) and dataset_summary.json.
     """
     import json
 
@@ -373,33 +312,20 @@ def collect(run_dir, holdout=(), episodes=80, seeds=(0, 1, 2),
     policies = {ck: SAC.load(ck) for ck in eligible}
 
     if verbose:
-        print("\nprobing checkpoints (fixed-scene start):")
+        print("\nprobing checkpoints:")
     rates = _probe_checkpoints(scene, policies, verbose=verbose)
-
-    scene.reset(seed=0)
-    base_start = np.asarray(scene.unwrapped._last_rand_vec, float)[:3]
-    pool_xy, pos_is_val = peg_position_pool(peg_positions, peg_x_range, peg_y_range,
-                                            val_position_share)
-    if verbose:
-        print(f"\npeg starts: {peg_positions} random positions in x {peg_x_range}, "
-              f"y {peg_y_range} ({int(pos_is_val.sum())} validation-only), "
-              f"{fixed_share:.0%} of episodes at the fixed start {base_start[:2].round(3)}")
 
     episodes_out = []
     for master_seed in seeds:
         torch.manual_seed(master_seed)
-        pos_rng = np.random.default_rng(PEG_POSITION_SEED + master_seed)
         seed = master_seed * COLLECTION_SEED_BLOCK
         for ck in eligible:
             tag = os.path.basename(ck)
             for _ in range(episodes):
-                pid = choose_position(pos_rng, len(pool_xy), fixed_share)
-                offset = None if pid < 0 else np.r_[pool_xy[pid] - base_start[:2], 0.0]
-                obs_seq, _flags, fs = collect_episode(policies[ck], scene, seed=seed,
-                                                      peg_offset=offset)
+                obs_seq, _flags, fs = collect_episode(policies[ck], scene, seed=seed)
                 seed += 1
                 episodes_out.append(dict(obs=obs_seq, steps=build_labels(obs_seq, fs),
-                                         success=fs, source=tag, position_id=pid,
+                                         success=fs, source=tag,
                                          collection_seed=master_seed))
         if verbose:
             mine = [e for e in episodes_out if e["collection_seed"] == master_seed]
@@ -407,7 +333,7 @@ def collect(run_dir, holdout=(), episodes=80, seeds=(0, 1, 2),
                   f"({sum(1 for e in mine if e['success'] is not None)} successful)")
     scene.close()
 
-    ep_splits, split_info = assign_position_splits(episodes_out, pos_is_val, val_fraction)
+    ep_splits, split_info = assign_splits(episodes_out, val_fraction=val_fraction)
 
     def stack(fn):
         return np.concatenate([fn(i, e) for i, e in enumerate(episodes_out)])
@@ -421,7 +347,6 @@ def collect(run_dir, holdout=(), episodes=80, seeds=(0, 1, 2),
         frame_idxs=stack(lambda i, e: np.arange(len(e["obs"]), dtype=np.int32)),
         collection_seeds=stack(lambda i, e: np.full(len(e["obs"]), e["collection_seed"], np.int32)),
         split=stack(lambda i, e: np.full(len(e["obs"]), ep_splits[i], dtype="U5")),
-        position_ids=stack(lambda i, e: np.full(len(e["obs"]), e["position_id"], np.int16)),
     )
 
     n_unique = len({hash(e["obs"].tobytes()) for e in episodes_out})
@@ -442,33 +367,13 @@ def collect(run_dir, holdout=(), episodes=80, seeds=(0, 1, 2),
                     collected_success_rate=succ / len(eps) if eps else 0.0)
 
     per_source = [source_stats(ck) for ck in eligible]
-
-    def position_stats(kind):
-        eps = [e for e in episodes_out
-               if (e["position_id"] < 0 if kind == "fixed" else
-                   e["position_id"] >= 0 and pos_is_val[e["position_id"]] == (kind == "val"))]
-        succ = sum(1 for e in eps if e["success"] is not None)
-        return dict(episodes=len(eps), successful=succ, failed=len(eps) - succ,
-                    distinct_positions=len({e["position_id"] for e in eps}))
-
-    peg_info = dict(
-        num_positions=int(peg_positions), x_range=list(peg_x_range), y_range=list(peg_y_range),
-        fixed_share=fixed_share, val_position_share=val_position_share,
-        fixed_start=base_start.tolist(),
-        positions=[dict(id=i, x=float(x), y=float(y), split="val" if v else "train")
-                   for i, ((x, y), v) in enumerate(zip(pool_xy, pos_is_val))],
-        fixed_start_episodes=position_stats("fixed"),
-        train_position_episodes=position_stats("train"),
-        val_position_episodes=position_stats("val"))
     summary = dict(
         total_rows=int(len(X)), total_episodes=len(episodes_out), obs_dim=int(X.shape[1]),
         unique_trajectories=n_unique,
         duplicate_fraction=float(1 - n_unique / len(episodes_out)),
         successful_episodes=n_succ, failed_episodes=len(episodes_out) - n_succ,
         collection_seeds=[int(s) for s in seeds], episodes_per_checkpoint=episodes,
-        policy_sampling="stochastic", action_noise=None,
-        scene="random peg starts (see peg_starts); box and hole fixed",
-        peg_starts=peg_info,
+        policy_sampling="stochastic", action_noise=None, scene="fixed",
         split=dict(requested_val_fraction=val_fraction, **split_info,
                    train=split_stats("train"), val=split_stats("val")),
         sources=[os.path.basename(c) for c in eligible],
@@ -498,10 +403,6 @@ def collect(run_dir, holdout=(), episodes=80, seeds=(0, 1, 2),
             print(f"  {s['checkpoint']:<40} {s['successful']:>4}s / {s['failed']:>4}f")
         print(f"split: train {tr['episodes']} eps ({tr['successful']}s/{tr['failed']}f) | "
               f"val {va['episodes']} eps ({va['successful']}s/{va['failed']}f)")
-        for kind in ("fixed_start_episodes", "train_position_episodes", "val_position_episodes"):
-            st = peg_info[kind]
-            print(f"  {kind.replace('_', ' '):<26} {st['episodes']:>5} eps at "
-                  f"{st['distinct_positions']:>3} position(s): {st['successful']}s/{st['failed']}f")
         if va["failed"] == 0:
             print(">>> WARNING: val has no FAILED episodes — succ/all cannot be compared")
         if summary["duplicate_fraction"] > 0.1:

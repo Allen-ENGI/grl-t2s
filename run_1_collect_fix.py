@@ -2,14 +2,11 @@
 """
 STAGE 1 of 4 — data collection.
 
-    python run_1_collect.py --run-name v10
-    python run_1_collect.py --run-name v10 --peg-positions 300 --fixed-share 0.3
+    python run_1_collect.py --run-name v3
 
-Collects from every expert checkpoint (minus any holdout). Each episode starts with
-the peg either at the fixed-scene position or at one of --peg-positions random
-positions (box and hole never move); downstream RL still uses the fixed scene.
-A share of the random positions is validation-only, so validation tests unseen
-peg positions. Audits the result and writes a manifest for run_2.
+Collects from every expert checkpoint (minus any holdout) on the fixed scene,
+with the policy sampled and no action noise. Assigns the train/val split,
+audits the result, and writes a manifest for run_2_train.py.
 """
 import argparse
 import json
@@ -30,9 +27,9 @@ STAGE_MANIFEST = "stage_manifest.json"
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Stage 1: T2S data collection (checkpoints only, random peg starts)",
+        description="Stage 1: T2S data collection (checkpoints only)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--run-name", default="v4", help="run name (use a new one for every collection)")
+    p.add_argument("--run-name", default="v3", help="run name; run_2 is pointed at this")
     p.add_argument("--holdout", nargs="*", default=[],
                    help="checkpoints to reserve and not collect from")
     p.add_argument("--reference-policies", nargs=2, default=None,
@@ -45,19 +42,7 @@ def parse_args(argv=None):
                    help="episodes per checkpoint per seed")
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2],
                    help="independent passes; the main diversity knob")
-    p.add_argument("--val", type=float, default=0.3,
-                   help="validation share of the FIXED-START episodes")
-    # ---- random peg starts --------------------------------------------------
-    p.add_argument("--peg-positions", type=int, default=data_collection.NUM_PEG_POSITIONS,
-                   help="number of distinct random peg start positions")
-    p.add_argument("--peg-x-range", type=float, nargs=2, default=list(data_collection.PEG_X_RANGE),
-                   metavar=("XMIN", "XMAX"), help="peg x range, metres")
-    p.add_argument("--peg-y-range", type=float, nargs=2, default=list(data_collection.PEG_Y_RANGE),
-                   metavar=("YMIN", "YMAX"), help="peg y range, metres")
-    p.add_argument("--fixed-share", type=float, default=data_collection.FIXED_START_SHARE,
-                   help="share of episodes at the fixed-scene peg start")
-    p.add_argument("--val-position-share", type=float, default=data_collection.VAL_POSITION_SHARE,
-                   help="share of the random positions used only for validation")
+    p.add_argument("--val", type=float, default=0.3, help="validation share")
     p.add_argument("--allow-flagged", action="store_true",
                    help="exit 0 even if a blocking audit check fails")
     return p.parse_args(argv)
@@ -68,30 +53,19 @@ def main(argv=None):
     config.ensure_dirs()
     ensure_fixed_task()
 
-    if args.run_name in results.list_runs("data_collection"):
-        print(f"ERROR: data run {args.run_name!r} already exists; use a new name so earlier "
-              "T2S runs keep pointing at unchanged data", file=sys.stderr)
-        return 1
-
     run_dir = results.new_run_dir(
         "data_collection", args.run_name,
         meta=dict(stage="1_collect", seeds=args.seeds, episodes=args.episodes,
                   val_fraction=args.val, holdout=args.holdout,
-                  policy_sampling="stochastic", action_noise=None,
-                  scene="random peg starts, fixed box and hole",
-                  peg_positions=args.peg_positions, peg_x_range=args.peg_x_range,
-                  peg_y_range=args.peg_y_range, fixed_share=args.fixed_share,
-                  val_position_share=args.val_position_share))
+                  policy_sampling="stochastic", action_noise=None, scene="fixed"))
     print(f"=== Stage 1: data collection -> {run_dir} ===\n")
 
     summary = data_collection.collect(
         run_dir, holdout=args.holdout, episodes=args.episodes,
         seeds=tuple(args.seeds), val_fraction=args.val,
         references=args.references,
-        reference_policies=tuple(args.reference_policies) if args.reference_policies else None,
-        peg_positions=args.peg_positions, peg_x_range=tuple(args.peg_x_range),
-        peg_y_range=tuple(args.peg_y_range), fixed_share=args.fixed_share,
-        val_position_share=args.val_position_share)
+        reference_policies=tuple(args.reference_policies)
+        if args.reference_policies else None)
 
     print("\n=== audit ===")
     dataset_path = os.path.join(run_dir, "dataset.npz")
@@ -121,16 +95,15 @@ def main(argv=None):
         references=summary.get("references"),
         references_dir=os.path.join(run_dir, "references"),
         failure_sources=summary["failure_sources"], split=summary["split"],
-        peg_starts={k: v for k, v in summary["peg_starts"].items() if k != "positions"},
         total_episodes=summary["total_episodes"],
         duplicate_fraction=summary["duplicate_fraction"],
         audit_blocking=blocking, audit_advisory=advisory, ok=not blocking)
+    
     with open(os.path.join(run_dir, STAGE_MANIFEST), "w") as f:
         json.dump(manifest, f, indent=2)
 
     print(f"\nwrote {os.path.join(run_dir, STAGE_MANIFEST)}")
-    print(f"next:  python run_2_t2s.py --data-run {args.run_name} --run-name <new t2s run> "
-          f"--model tdlambdaboot_all")
+    # print(f"next:  python run_2_train.py --data-run {args.run_name} --run-name {args.run_name}")
     return 0 if (manifest["ok"] or args.allow_flagged) else 1
 
 
