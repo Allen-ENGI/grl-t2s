@@ -27,11 +27,11 @@ def parse_args(argv=None):
         description="Stage 2: T2S training",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--data-run", required=True, help="run name from run_1_collect.py")
-    p.add_argument("--run-name", default="v8", help="t2s_model run name")
+    p.add_argument("--run-name", required=True, help="t2s_model run name")
     p.add_argument("--seed", type=int, default=0, help="single training seed")
     p.add_argument("--device", default=None, help="cuda|cpu (default: auto)")
-    p.add_argument("--model", default=None,
-                   help="train just this combo, e.g. tdlambdaboot_all or mc_succ "
+    p.add_argument("--models", "--model", dest="models", nargs="+", default=None,
+                   help="train just these combos, e.g. tdlambdaboot_all tdlambdaboot_succ "
                         "(default: the full grid)")
     return p.parse_args(argv)
 
@@ -75,24 +75,39 @@ def main(argv=None):
         print(f"WARNING: Stage 1 reported blocking audit failures "
               f"{stage1.get('audit_blocking')}; results here may be meaningless.\n")
 
-    grid = (model_grid(args.model) if args.model else
-            dict(methods=t2s_train.METHODS, conditions=t2s_train.CONDITIONS,
-                 censor_schemes=t2s_train.CENSOR_SCHEMES))
-    n = len(grid["methods"]) * len(grid["conditions"]) * len(grid["censor_schemes"])
+    grids = ([model_grid(m) for m in args.models] if args.models else
+             [dict(methods=t2s_train.METHODS, conditions=t2s_train.CONDITIONS,
+                   censor_schemes=t2s_train.CENSOR_SCHEMES)])
+    n = sum(len(g["methods"]) * len(g["conditions"]) * len(g["censor_schemes"]) for g in grids)
+
+    if args.run_name in results.list_runs("t2s_model"):
+        print(f"ERROR: T2S run {args.run_name!r} already exists; training into it would "
+                "overwrite its checkpoints and manifests. Use a new --run-name.", file=sys.stderr)
+        return 1
 
     run_dir = results.new_run_dir(
         "t2s_model", args.run_name,
         meta=dict(stage="2_train", data_run=args.data_run, seed=args.seed,
-                  model=args.model, bootstrap_gamma=config.T2S_BOOTSTRAP_GAMMA))
+                  model=args.models, bootstrap_gamma=config.T2S_BOOTSTRAP_GAMMA))
     print(f"=== Stage 2: training {n} model(s) on {args.data_run} "
           f"({stage1['total_episodes']} episodes) -> {run_dir} ===")
     print(f"    device={device}  seed={args.seed}  "
           f"bootstrap gamma={config.T2S_BOOTSTRAP_GAMMA}\n")
 
-    _models, _hist, rows = t2s_train.run_all_combos(
-        run_dir, stage1["dataset_path"], seed=args.seed, device=device,
-        bootstrap_gamma=config.T2S_BOOTSTRAP_GAMMA, **grid)
-
+    rows, merged = [], None
+    for g in grids:
+        _models, _hist, r = t2s_train.run_all_combos(
+            run_dir, stage1["dataset_path"], seed=args.seed, device=device,
+            bootstrap_gamma=config.T2S_BOOTSTRAP_GAMMA, **g)
+        rows += r
+        m = json.load(open(os.path.join(run_dir, "manifest.json")))
+        if merged is None:
+            merged = m
+        else:
+            merged["combos"].update(m["combos"])
+    with open(os.path.join(run_dir, "manifest.json"), "w") as f:
+        json.dump(merged, f, indent=2)
+        
     if not rows:
         print("ERROR: nothing trained", file=sys.stderr)
         return 1

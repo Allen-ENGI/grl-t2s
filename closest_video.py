@@ -38,7 +38,7 @@ def main():
                             "mean_final_peg_goal_distance", "best_min_hand_peg_distance"],
                    help="mean_* = averaged over eval episodes (robust); best_* = single closest episode")
     p.add_argument("--checkpoint", default=None, help="film this one instead of the closest")
-    p.add_argument("--seeds", type=int, nargs="+", default=[500])
+    p.add_argument("--seeds", type=int, nargs="+", default=list(range(500, 510)))
     p.add_argument("--reward-mode", default="difference_timed",
                    choices=["absolute", "difference", "difference_timed"])
     p.add_argument("--list", action="store_true", help="print the ranking and stop")

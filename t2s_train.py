@@ -57,6 +57,9 @@ CONDITIONS = ("succ", "all")
 CENSOR_SCHEMES = ("censor", "bootstrap")
 
 
+
+MAX_PEG_DISTANCE = 0.08   # metres from the fixed start; None = use every random position
+
 def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=CONFIRM_BUFFER,
                      censor_bootstrap=False):
     """
@@ -77,6 +80,20 @@ def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=CON
             "with the current data_collection, which assigns train/val at collection "
             "time — see its module docstring for why the split moved out of this file.")
     split_all = raw["split"].astype(str)
+    
+    pos_ids = raw["position_ids"] if "position_ids" in raw.files else np.full(len(y_all), -1)
+    if MAX_PEG_DISTANCE is not None and (pos_ids >= 0).any():
+        import json
+        peg = json.load(open(os.path.join(os.path.dirname(dataset_path),
+                                          "dataset_summary.json")))["peg_starts"]
+        pool = np.array([[p["x"], p["y"]] for p in peg["positions"]])
+        near = np.linalg.norm(pool - np.array(peg["fixed_start"][:2]), axis=1) <= MAX_PEG_DISTANCE
+        rows = (pos_ids < 0) | near[np.clip(pos_ids, 0, None)]
+        X_all, y_all = X_all[rows], y_all[rows]
+        episode_ids_all, frame_idxs_all = episode_ids_all[rows], frame_idxs_all[rows]
+        split_all = split_all[rows]
+        print(f"  kept fixed start + {int(near.sum())} of {len(pool)} random positions "
+              f"within {100 * MAX_PEG_DISTANCE:.0f} cm ({rows.mean():.0%} of rows)")
 
     # is_failed_episode = np.array([
     #     np.all(y_all[episode_ids_all == ep] == censor_label) for ep in episode_ids_all

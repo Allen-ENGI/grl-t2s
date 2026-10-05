@@ -21,5 +21,7 @@ run_4_policy - downstream RL training
 New added scriptes for adjust peg initial positions:
 
 peg_range - check the range of expert policy to succed with different peg location
+check_pegrandom - visualize the random inital position for pegs in the dataset
+
 scene_edit - funciton that modify the peg location
 t2s_attribution - analyze how different element in the dataset matrix impact the t2s predicition

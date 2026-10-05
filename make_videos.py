@@ -19,7 +19,7 @@ import sys
 # ---------------------------------------------------------------------------
 MODELS = None
 
-T2S_RUN = "v8"                      # t2s_model run name (run_2_train.py --run-name)
+# T2S_RUN = "v10"                      # t2s_model run name (run_2_train.py --run-name)
 REWARD_MODE = "difference_timed"    # absolute | difference | difference_timed
 SEEDS = (500,)                      # rollout seeds; one video per model per seed
 FPS = None                          # None -> t2s_video.FPS (12)
@@ -32,7 +32,7 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Render live T2S prediction videos",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--t2s-run", default=T2S_RUN, help="t2s_model run name")
+    p.add_argument("--t2s-run",required =True, help="t2s_model run name")
     p.add_argument("--models", nargs="+", default=MODELS,
                    help="combo names to film (default: the MODELS list in this file, "
                         "or all combos in the run)")
