@@ -9,25 +9,22 @@ Trajectories are live rollouts of the two Stage 3 evaluation policies, grouped b
 whether the episode succeeded. Each measure is computed on every trajectory, then
 averaged over the successful and over the failed trajectories (with a 95% range).
 
-Notation, over the steps t = 1..n up to success (or the whole failed episode):
+Over the steps t = 1..n up to success (or the whole failed episode):
     p_t   T2S prediction at the state after step t
-    P_t   T2S progress = p_0 - p_t            (rises as the task progresses, starts at 0)
     m_t   MetaWorld reward at the state after step t
-    r_t   T2S reward the policy is paid at step t, for a reward mode (training formula)
-    dm_t  change in MetaWorld reward, m_t - m_{t-1}
+and the two series compared, as changes over WINDOW steps (both rise with progress):
+    a_t = p_t - p_{t+k}        how much the T2S prediction dropped (= the T2S reward
+                               the policy collects over those k steps, without discount)
+    b_t = m_{t+k} - m_t        how much MetaWorld's reward rose
 
-Three kinds of measure:
-    Spearman            rank correlation: do the two put the steps in the same order?
-    direction           sum(a*b) / sum(|a|*|b|): do they move the same way, weighted by
-                        how much both move (from -1 to +1; flat stretches count little)
-    scale-fitted gap    each series divided by its own largest absolute value, then
-                        mean |a/max|a| - b/max|b||: how different the patterns are once
-                        both fit the same scale (0 = same pattern, up to 2)
-
-Applied to:
-    levels               P_t vs m_t
-    <mode> per step      r_t vs dm_t, for difference and difference_timed
-    changes over k steps (P_t+k - P_t) vs (m_t+k - m_t)
+Three measures, each computed per trajectory, then averaged:
+    Spearman           rank correlation of a and b: do the two put the steps in the same
+                       order (the sequence pattern of the two rewards)?
+    direction          sum(a_t * b_t) / sum(|a_t| * |b_t|): agreement of the SIGNS of a and b,
+                       each step weighted by how much both move (-1 always opposite,
+                       +1 always the same way)
+    scale-fitted gap   mean |a_t / max|a| - b_t / max|b||: each series divided by its own
+                       largest absolute value, then the average gap (0 = same pattern, up to 2)
 """
 import argparse
 import json
@@ -39,11 +36,9 @@ from scipy.stats import spearmanr
 
 import config
 import results
-from reward_fn import step_reward
 
 # ---- settings ---------------------------------------------------------------
-MODES = ("difference", "difference_timed")
-WINDOW_SIZES = (5, 10)              # extra windows for changes in progress
+WINDOW = 5                          # compare changes over this many steps (1 = every step)
 BOOTSTRAP_SAMPLES = 2000
 STAGE_MANIFEST = "stage_manifest.json"
 
@@ -73,18 +68,17 @@ def rollout(policy, seed):
     return np.array(observations), np.array(rewards), success_step
 
 
-def series(predictions, metaworld_rewards, success_step):
-    """Progress P_1..P_n, MetaWorld m_1..m_n, and the per-mode T2S rewards r_1..r_n."""
+def series(predictions, metaworld_rewards, success_step, k=WINDOW):
+    """a: drop in the T2S prediction over k steps; b: rise in MetaWorld's reward over k steps.
+    Steps 1..n up to success; the prediction at the success state counts as 0, as in training."""
     n = len(metaworld_rewards) if success_step is None else min(success_step, len(metaworld_rewards))
-    p = np.asarray(predictions, float)
-    progress = p[0] - p[1:n + 1]
-    metaworld = np.asarray(metaworld_rewards[:n], float)
-    nxt = p[1:n + 1].copy()
+    p = np.asarray(predictions, float)[1:n + 1].copy()
     if success_step is not None and success_step <= n:
-        nxt[success_step - 1] = 0.0                       # the wrapper's value at success
-    paid = {m: np.array([step_reward(p[i], nxt[i], reward_mode=m, time_penalty=config.TIME_PENALTY,
-                                     gamma=config.RL_GAMMA) for i in range(n)]) for m in MODES}
-    return progress, metaworld, paid
+        p[success_step - 1] = 0.0
+    m = np.asarray(metaworld_rewards[:n], float)
+    if n <= k:
+        return np.array([]), np.array([])
+    return p[:-k] - p[k:], m[k:] - m[:-k]
 
 
 # ---- 2. measures ------------------------------------------------------------
@@ -98,6 +92,7 @@ def spearman(a, b):
 
 def direction(a, b):
     """sum(a*b) / sum(|a|*|b|), from -1 (always opposite) to +1 (always the same way)."""
+    
     a, b = np.asarray(a, float), np.asarray(b, float)
     both = np.sum(np.abs(a) * np.abs(b))
     return float(np.sum(a * b) / both) if len(a) >= 3 and both > 0 else None
@@ -112,23 +107,12 @@ def scale_fitted_gap(a, b):
     return float(np.mean(np.abs(a / ma - b / mb)))
 
 
-def trajectory_measures(progress, metaworld, paid):
-    m = {"levels: Spearman": spearman(progress, metaworld),
-         "levels: scale-fitted gap": scale_fitted_gap(progress, metaworld)}
-    dm = np.diff(metaworld)
-    for mode in MODES:
-        r = paid[mode][1:]                                # aligned with dm (steps 2..n)
-        m[f"{mode} per step: Spearman"] = spearman(r, dm)
-        m[f"{mode} per step: direction"] = direction(r, dm)
-        m[f"{mode} per step: scale-fitted gap"] = scale_fitted_gap(r, dm)
-    for k in WINDOW_SIZES:
-        if len(progress) > k + 2:
-            dp, dmk = progress[k:] - progress[:-k], metaworld[k:] - metaworld[:-k]
-            m[f"changes over {k} steps: Spearman"] = spearman(dp, dmk)
-            m[f"changes over {k} steps: direction"] = direction(dp, dmk)
-        else:
-            m[f"changes over {k} steps: Spearman"] = m[f"changes over {k} steps: direction"] = None
-    return m
+MEASURES = ("Spearman", "direction", "scale-fitted gap")
+
+
+def trajectory_measures(a, b):
+    return {"Spearman": spearman(a, b), "direction": direction(a, b),
+            "scale-fitted gap": scale_fitted_gap(a, b)}
 
 
 def average_with_range(values):
@@ -151,47 +135,38 @@ def as_text(result):
 # ---- 3. plots ---------------------------------------------------------------
 
 def plot_example(title, predictions, metaworld_rewards, success_step, path):
-    """Raw curves; levels on a common scale; per-step signals on a common scale."""
+    """Top: the raw curves. Bottom: the two compared series, each over its largest |value|."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    progress, metaworld, paid = series(predictions, metaworld_rewards, success_step)
-    t = np.arange(1, len(metaworld) + 1)
-    unit = lambda v: v / np.abs(v).max() if np.abs(v).max() > 0 else v
-
-    fig, ax = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
-    ax[0].plot(t, np.asarray(predictions, float)[1:len(t) + 1], color="tab:orange", lw=2,
-               label="T2S prediction")
+    a, b = series(predictions, metaworld_rewards, success_step)
+    n = len(metaworld_rewards) if success_step is None else min(success_step, len(metaworld_rewards))
+    unit = lambda v: v / np.abs(v).max() if len(v) and np.abs(v).max() > 0 else v
+    fig, ax = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    t = np.arange(1, n + 1)
+    ax[0].plot(t, np.asarray(predictions, float)[1:n + 1], color="tab:orange", lw=2, label="T2S prediction")
     ax[0].set_ylabel("T2S prediction (steps)", color="tab:orange")
     twin = ax[0].twinx()
-    twin.plot(t, metaworld, color="black", lw=1.5, label="MetaWorld reward")
+    twin.plot(t, np.asarray(metaworld_rewards[:n], float), color="black", lw=1.5, label="MetaWorld reward")
     twin.set_ylabel("MetaWorld reward")
-    ax[0].set_title(title, fontsize=10)
     ax[0].legend(handles=ax[0].get_legend_handles_labels()[0] + twin.get_legend_handles_labels()[0],
                  fontsize=8, loc="center right")
-
-    ax[1].plot(t, unit(progress), color="tab:orange", lw=2, label="T2S progress / its largest |value|")
-    ax[1].plot(t, unit(metaworld), color="black", lw=1.5, label="MetaWorld reward / its largest |value|")
-    ax[1].set_ylabel("levels, common scale")
-    rho = spearman(progress, metaworld)
-    ax[1].text(0.01, 0.95, "Spearman " + ("--" if rho is None else format(rho, "+.2f")),
+    ax[0].set_title(title, fontsize=10)
+    tt = np.arange(1, len(a) + 1)
+    ax[1].plot(tt, unit(a), color="tab:orange", lw=1.3, label=f"drop in T2S prediction over {WINDOW} steps")
+    ax[1].plot(tt, unit(b), color="black", lw=1.3, label=f"rise in MetaWorld reward over {WINDOW} steps")
+    ax[1].axhline(0, color="0.6", lw=0.8)
+    ax[1].set_ylabel("each / its largest |value|"); ax[1].set_xlabel("step")
+    vals = trajectory_measures(a, b)
+    ax[1].text(0.01, 0.97, "   ".join(f"{k} {'--' if v is None else format(v, '+.2f')}"
+                                      for k, v in vals.items()),
                transform=ax[1].transAxes, va="top", fontsize=8)
-
-    r, dm = paid["difference"][1:], np.diff(metaworld)
-    ax[2].plot(t[1:], unit(r), color="tab:orange", lw=1.2, label="T2S reward (difference) / largest |value|")
-    ax[2].plot(t[1:], unit(dm), color="black", lw=1.2, label="change in MetaWorld / largest |value|")
-    ax[2].axhline(0, color="0.6", lw=0.8)
-    ax[2].set_ylabel("per step, common scale"); ax[2].set_xlabel("step")
-    d = direction(r, dm)
-    ax[2].text(0.01, 0.95, "direction " + ("--" if d is None else format(d, "+.2f")),
-               transform=ax[2].transAxes, va="top", fontsize=8)
-    for a in ax:
+    ax[1].legend(fontsize=8, loc="lower right")
+    for x in ax:
         if success_step is not None:
-            a.axvline(success_step, color="tab:green", ls=":")
-        a.grid(alpha=0.3)
-    for a in ax[1:]:
-        a.legend(fontsize=8, loc="lower right")
+            x.axvline(success_step, color="tab:green", ls=":")
+        x.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=140)
     plt.close(fig)
@@ -283,11 +258,11 @@ def main(argv=None):
                               for n in names} for o in ("successful", "failed")}
         counts = {o: sum(r["outcome"] == o for r in rows) for o in ("successful", "failed")}
 
-        print(f"Model {model}")
-        print(f"  {'':<44}{'successful (' + str(counts['successful']) + ')':<30}"
+        print(f"Model {model}   (changes over {WINDOW} steps)")
+        print(f"  {'':<20}{'successful (' + str(counts['successful']) + ')':<30}"
               f"{'failed (' + str(counts['failed']) + ')':<30}")
         for n in names:
-            print(f"  {n:<44}{as_text(summary[model]['successful'][n]):<30}"
+            print(f"  {n:<20}{as_text(summary[model]['successful'][n]):<30}"
                   f"{as_text(summary[model]['failed'][n]):<30}")
         print()
 
