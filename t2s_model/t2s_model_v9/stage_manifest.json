@@ -1,0 +1,34 @@
+{
+  "stage": "2_train",
+  "run_name": "v9",
+  "run_dir": "D:\\!DUKE\\2026_Fall\\Independent_Research\\grl-t2s\\train_res\\t2s_model\\v9",
+  "data_run": "v4",
+  "data_run_dir": "D:\\!DUKE\\2026_Fall\\Independent_Research\\grl-t2s\\train_res\\data_collection\\v4",
+  "dataset_path": "D:\\!DUKE\\2026_Fall\\Independent_Research\\grl-t2s\\train_res\\data_collection\\v4\\dataset.npz",
+  "dataset_summary_path": "D:\\!DUKE\\2026_Fall\\Independent_Research\\grl-t2s\\train_res\\data_collection\\v4\\dataset_summary.json",
+  "holdout_checkpoints": [],
+  "seed": 0,
+  "device": "cuda",
+  "t2s_bootstrap_gamma": 0.995,
+  "combos": {
+    "tdlambdaboot_all": {
+      "method": "tdlambda",
+      "condition": "all",
+      "censor_scheme": "bootstrap",
+      "gamma": 0.995,
+      "val_mse": 19605.75390625,
+      "val_mse_succ_only": 2798.529052734375,
+      "best_seed": 0
+    },
+    "tdlambdaboot_succ": {
+      "method": "tdlambda",
+      "condition": "succ",
+      "censor_scheme": "bootstrap",
+      "gamma": 0.995,
+      "val_mse": 2989.255126953125,
+      "val_mse_succ_only": 2989.255126953125,
+      "best_seed": 0
+    }
+  },
+  "ok": true
+}

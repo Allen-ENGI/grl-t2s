@@ -1,0 +1,32 @@
+{
+  "obs_dim": 39,
+  "seed": 0,
+  "target_clip": 360.0,
+  "normalization_file": "normalization.npz",
+  "censor_schemes": [
+    "bootstrap"
+  ],
+  "bootstrap_gamma": 0.995,
+  "combos": {
+    "tdlambdaboot_all": {
+      "method": "tdlambda",
+      "condition": "all",
+      "censor_scheme": "bootstrap",
+      "gamma": 0.995,
+      "checkpoint": "tdlambdaboot_all_seed0.pt",
+      "val_mse": 19605.75390625,
+      "val_mse_succ_only": 2798.529052734375,
+      "best_seed": 0
+    },
+    "tdlambdaboot_succ": {
+      "method": "tdlambda",
+      "condition": "succ",
+      "censor_scheme": "bootstrap",
+      "gamma": 0.995,
+      "checkpoint": "tdlambdaboot_succ_seed0.pt",
+      "val_mse": 2989.255126953125,
+      "val_mse_succ_only": 2989.255126953125,
+      "best_seed": 0
+    }
+  }
+}
