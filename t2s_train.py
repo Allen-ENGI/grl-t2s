@@ -58,7 +58,7 @@ CENSOR_SCHEMES = ("censor", "bootstrap")
 
 
 
-MAX_PEG_DISTANCE = 0.08   # metres from the fixed start; None = use every random position
+MAX_PEG_DISTANCE = None   # metres from the fixed start; None = use every random position
 
 def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=CONFIRM_BUFFER,
                      censor_bootstrap=False):
