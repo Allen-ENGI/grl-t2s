@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""
+Drive the arm manually, then hand over to a successful policy, and film the
+T2S prediction across both phases.
+
+    python manual_drive.py --drive "back:25,up:15"
+    python manual_drive.py --drive retreat --models tdlambdaboot_succ td0_all
+    python manual_drive.py --drive "back:40" --policy-run sweep_v6_td0boot_all_seed0
+
+"""
+import argparse
+import json
+import os
+import sys
+import numpy as np
+
+import core.config as config
+import core.results as results
+import stage_3_t2s_eval.t2s_video as t2s_video
+from stage_2_t2s_training.t2s_model import load_t2s_predictor
+
+import torch
+
+from core.config import SUCCESS_KEY
+from core.env_utils import make_fixed_scene_env
+from stage_3_t2s_eval.t2s_video import render_frame
+
+from core.scene_edit import reset_with_peg_offset
+
+# MetaWorld action: [dx, dy, dz, gripper], each in [-1, 1]
+MOVES = {
+    "forward": (0.0,  1.0, 0.0, 0.0),
+    "back":    (0.0, -1.0, 0.0, 0.0),
+    "right":   (1.0,  0.0, 0.0, 0.0),
+    "left":    (-1.0, 0.0, 0.0, 0.0),
+    "up":      (0.0,  0.0, 1.0, 0.0),
+    "down":    (0.0,  0.0, -1.0, 0.0),
+    "open":    (0.0,  0.0, 0.0, -1.0),
+    "close":   (0.0,  0.0, 0.0, 1.0),
+    "still":   (0.0,  0.0, 0.0, 0.0),
+}
+PRESETS = {
+    # "retreat" drives the arm to the corner of its workspace: at 1.0 per step,
+    # back:30 + up:30 is far outside anything in the demonstrations, so the
+    # TAKEOVER POLICY is as off-manifold there as the T2S model and often
+    # cannot return — which is why --calibrate exists.
+    "retreat": "back:30,up:10,left:10,still:5,forward:10",
+    "wander":  "left:15,back:15,right:15,up:10",
+    "lift":    "up:25",
+    "nudge":   "back:10",
+    "left":   "right:50,still:5",      # usually inside the expert's recovery basin
+}
+STAGE_MANIFEST = "stage_manifest.json"
+
+
+def parse_drive(spec):
+    """'back:25,up:15' -> [(name, action_vector, n_steps), ...]"""
+    spec = PRESETS.get(spec, spec)
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, n = part.partition(":")
+        name = name.strip().lower()
+        if name not in MOVES:
+            raise SystemExit(f"ERROR: unknown move {name!r}. Known: {sorted(MOVES)}\n"
+                             f"Presets: {sorted(PRESETS)}")
+        try:
+            steps = int(n) if n else 10
+        except ValueError:
+            raise SystemExit(f"ERROR: bad step count in {part!r}; use e.g. back:25")
+        out.append((name, np.array(MOVES[name], dtype=np.float32), steps))
+    if not out:
+        raise SystemExit("ERROR: empty drive script")
+    return out
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Manual drive, then policy takeover, filmed with T2S predictions",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--drive", default="retreat",
+                   help="'move:steps,...' or a preset: " + ", ".join(sorted(PRESETS)))
+    p.add_argument("--t2s-run", default="v9", help="t2s_model run name")
+    p.add_argument("--models", nargs="+", default=None,
+                   help="combo names to score (default: all in the run)")
+    p.add_argument("--takeover", default="success", choices=["success", "failure"],
+                   help="which held-out expert takes over after the drive. "
+                        "'success' answers 'can a competent policy recover, and "
+                        "did the model predict how long it would take'. 'failure' "
+                        "answers 'what does the model predict while a policy "
+                        "flounders somewhere it has never been' — the regime where "
+                        "a shaped reward actually operates, and the one no "
+                        "success-rollout metric can see.")
+    p.add_argument("--policy-run", default=None,
+                   help="take over with a TRAINED policy from this policy run "
+                        "instead of an expert; overrides --takeover")
+    p.add_argument("--checkpoint", default="policy_final.zip",
+                   help="which checkpoint inside --policy-run to load. Bare "
+                        "filename or absolute path. Checkpoints are written every "
+                        "ckpt_freq steps as policy_<steps>.zip, so e.g. "
+                        "policy_200000.zip films the policy mid-training — useful "
+                        "when the final one regressed, which progress.py's own "
+                        "docstring notes has happened in this project.")
+    p.add_argument("--reward-mode", default="difference",
+                   choices=["absolute", "difference", "difference_timed"])
+    p.add_argument("--gamma", type=float, default=None)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--max-steps", type=int, default=500)
+    p.add_argument("--fps", type=int, default=None)
+    p.add_argument("--out", default=None, help="output dir (default: the eval run's videos/)")
+    p.add_argument("--stochastic-takeover", dest="deterministic",
+                   action="store_false", default=True,
+                   help="sample the takeover policy instead of using its mean action. "
+                        "The mean is the default because the drive leaves the arm "
+                        "off-manifold, where the policy's action distribution is wide "
+                        "and sampling adds noise where it is least reliable.")
+    p.add_argument("--calibrate", action="store_true",
+                   help="scale the drive down until the takeover policy can still "
+                        "recover, and report the boundary. Run this when the expert "
+                        "cannot finish: it finds the largest displacement inside the "
+                        "policy's recovery basin, which is the strongest drive that "
+                        "still yields a pred@handover vs actual-steps comparison.")
+    p.add_argument("--probe", action="store_true",
+                   help="print distances after the drive and exit; no rendering")
+    
+    p.add_argument("--peg-offset", type=float, nargs=3, default=[0, 0, 0], metavar=("DX", "DY", "DZ"),
+                   help="move the peg's start by this much, in cm, relative to the fixed scene")
+    
+    
+    return p.parse_args(argv)
+
+
+def scale_drive(drive, factor):
+    """Same moves, step counts scaled. Used to find the largest drive the
+    takeover policy can still recover from."""
+    return [(n, a, max(1, int(round(s * factor)))) for n, a, s in drive]
+
+
+def drive_then_policy(policy, drive, seed=0, max_steps=500, stop_after_success=20,
+                      deterministic=True, peg_offset=[0, 0, 0]):
+    """
+    Run the scripted drive, then hand control to `policy`. Returns a rollout
+    dict plus `handover` (the frame index where the policy took over) and
+    `phases` (a per-frame label).
+
+    success_step follows the package contract: index of the first state that IS
+    successful. It is reported RELATIVE TO THE START, so `success_step -
+    handover` is what the policy actually took from the pose it inherited.
+    """
+    
+    env = make_fixed_scene_env(render_mode="rgb_array")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    obs, _ = env.reset(seed=seed)
+    obs = reset_with_peg_offset(env, seed, np.asarray(peg_offset) / 100)
+    # obs = move_peg(env, np.asarray(peg_offset) / 100)
+
+    obs_list, frames, phases = [], [], []
+    success_step = None
+    t = 0
+
+    # ---- manual phase ----------------------------------------------------
+    for name, action, steps in drive:
+        for _ in range(steps):
+            if t >= max_steps:
+                break
+            obs_list.append(np.asarray(obs, dtype=np.float32).copy())
+            frames.append(render_frame(env))
+            phases.append(f"MANUAL {name}")
+            obs, _r, term, trunc, info = env.step(
+                np.clip(action, env.action_space.low, env.action_space.high))
+            if info.get(SUCCESS_KEY, 0) and success_step is None:
+                success_step = t + 1
+            t += 1
+            if term or trunc:
+                break
+    handover = t
+
+    # ---- policy phase ----------------------------------------------------
+    while t < max_steps:
+        obs_list.append(np.asarray(obs, dtype=np.float32).copy())
+        frames.append(render_frame(env))
+        phases.append("POLICY")
+        # DETERMINISTIC by default for the takeover. The drive deliberately
+        # leaves the arm off the demonstration manifold, where the policy's
+        # action distribution is both wrong and WIDE — sampling from it adds
+        # noise exactly where the policy is least reliable, so a recoverable
+        # pose can still fail. The mean action is the policy's best guess, and
+        # this phase is asking "CAN it recover", not "what does it usually do".
+        action, _ = policy.predict(obs, deterministic=deterministic)
+        obs, _r, term, trunc, info = env.step(action)
+        if info.get(SUCCESS_KEY, 0) and success_step is None:
+            success_step = t + 1
+        t += 1
+        if success_step is not None and t >= success_step + stop_after_success:
+            break
+        if term or trunc:
+            break
+
+    obs_list.append(np.asarray(obs, dtype=np.float32).copy())
+    frames.append(render_frame(env))
+    phases.append("POLICY")
+    env.close()
+
+    from core.config import steps_remaining_curve
+    obs_arr = np.array(obs_list, dtype=np.float32)
+    return dict(obs=obs_arr, frames=frames, seed=seed, success_step=success_step,
+                handover=handover, phases=phases,
+                truth=steps_remaining_curve(len(obs_arr), success_step)
+                if success_step is not None else None)
+
+
+def render_phased(roll, predict_fn, save_path, combo, reward_mode, gamma, fps):
+    """
+    Like t2s_video.render_t2s_video, but the per-frame label carries the phase
+    and the handover marker, so the video says which part of the trajectory a
+    given prediction belongs to.
+    """
+    import stage_3_t2s_eval.t2s_video as t2s_video
+    from stage_4_rl_train.reward_preview import compute_step_rewards
+
+    obs = roll["obs"]
+    preds = np.array([predict_fn(o) for o in obs], dtype=np.float64)
+    rewards = compute_step_rewards(preds, reward_mode, gamma=gamma)
+    ss, ho = roll["success_step"], roll["handover"]
+    if ss is not None and len(rewards):
+        rewards = rewards.copy()
+        rewards[ss:] = 0.0                       # match the wrapper's success latch
+
+    n = min(len(roll["frames"]), len(preds), len(obs))
+    out = [t2s_video.compose_frame(
+               roll["frames"][i], i, preds[:n], truth=roll["truth"], obs=obs,
+               rewards=rewards, success_step=ss, reward_mode=reward_mode,
+               label=f"{combo} | {roll['phases'][i]}" + ("  <HANDOVER" if i == ho else ""))
+           for i in range(n)]
+    if save_path:
+        t2s_video.save_video(out, save_path, fps=fps)
+
+    return dict(
+        file=os.path.basename(save_path) if save_path else None,
+        pred_at_start=float(preds[0]),
+        pred_at_handover=float(preds[min(ho, n - 1)]),
+        pred_peak_during_drive=float(preds[:max(ho, 1)].max()),
+        # did the prediction RISE while the arm was driven away? It should.
+        rose_during_drive=bool(preds[min(ho, n - 1)] > preds[0]),
+        actual_steps_after_handover=(int(ss - ho) if ss is not None else None),
+        # lowest prediction once the takeover policy is driving: on a rollout
+        # that never succeeds this is the model's most confident false claim
+        pred_min_after_handover=float(preds[min(ho, n - 1):n].min()),
+        succeeded=ss is not None,
+        total_return=float(np.sum(rewards)),
+    )
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+
+    from stable_baselines3 import SAC
+
+    from core.progress import hand_peg_distance, peg_goal_distance
+
+    gamma = config.RL_GAMMA if args.gamma is None else args.gamma
+    fps = t2s_video.FPS if args.fps is None else args.fps
+    drive = parse_drive(args.drive)
+
+    total_manual = sum(s for _n, _a, s in drive)
+    print(f"=== manual drive: {', '.join(f'{n} x{s}' for n, _a, s in drive)} "
+          f"({total_manual} steps) ===")
+
+    # ---- the taking-over policy -----------------------------------------
+    t2s_dir = results.get_run_dir("t2s_model", args.t2s_run)
+    with open(os.path.join(t2s_dir, STAGE_MANIFEST)) as f:
+        stage2 = json.load(f)
+    eval_dir = results.get_run_dir("t2s_eval", args.t2s_run)
+    with open(os.path.join(eval_dir, STAGE_MANIFEST)) as f:
+        stage3 = json.load(f)
+
+    if args.policy_run:
+        import stage_3_t2s_eval.visualize as visualize
+        pol_dir = results.get_run_dir("policy", args.policy_run)
+        policy, path = visualize.load_policy(args.checkpoint, pol_dir)
+        print(f"    takeover: trained policy {os.path.basename(path)}")
+        takeover_name = os.path.basename(path)
+    else:
+        # the manifest key is "failure_ckpt", not "failed_ckpt"
+        key = "success_ckpt" if args.takeover == "success" else "failure_ckpt"
+        takeover_name = stage3[key]
+        path = os.path.join(config.EXPERT_POLICY_DIR, takeover_name)
+        policy = SAC.load(path)
+        print(f"    takeover: held-out {args.takeover} expert {takeover_name}")
+
+    # ---- calibration: how far can this policy come back from? ------------
+    if args.calibrate:
+        print(f"\n=== calibrating: how much drive can {takeover_name} recover from? ===")
+        print(f"{'scale':>7}{'manual steps':>14}{'hand->peg after':>18}"
+              f"{'recovered':>11}{'steps taken':>13}")
+        print("-" * 63)
+        best = None
+        for f in (0.1, 0.25, 0.5, 0.75, 1.0):
+            d = scale_drive(drive, f)
+            r = drive_then_policy(policy, d, seed=args.seed, max_steps=args.max_steps,
+                                  deterministic=args.deterministic)
+            h = r["handover"]
+            hp = hand_peg_distance(r["obs"][min(h, len(r["obs"]) - 1)])
+            ok = r["success_step"] is not None
+            took = (r["success_step"] - h) if ok else None
+            print(f"{f:>7.2f}{sum(x[2] for x in d):>14}{hp:>18.4f}"
+                  f"{('yes' if ok else 'NO'):>11}"
+                  f"{(str(took) if took is not None else '--'):>13}")
+            if ok:
+                best = f
+        if best is None:
+            print("\n  the policy recovered from NONE of these, even the 10% drive.")
+            print("  That is itself the finding: this expert cannot return to the peg")
+            print("  once displaced at all, so 'pred@handover vs actual' is not")
+            print("  available for any drive. Score the models on --takeover failure")
+            print("  instead, where the question is what they predict while a policy")
+            print("  flounders rather than how long recovery takes.")
+        else:
+            print(f"\n  largest recoverable scale: {best:.2f}  ->  rerun with")
+            print(f"    --drive \"{','.join(f'{n}:{st}' for n, _a, st in scale_drive(drive, best))}\"")
+        return 0
+
+    # ---- roll ONCE; every model scores the same frames -------------------
+    roll = drive_then_policy(policy, drive, seed=args.seed, max_steps=args.max_steps,
+                             deterministic=args.deterministic, peg_offset=args.peg_offset)
+    from core.progress import hand_peg_distance, peg_goal_distance
+    ho = roll["handover"]
+    o0, oh = roll["obs"][0], roll["obs"][min(ho, len(roll["obs"]) - 1)]
+    print(f"\nafter the drive ({ho} steps):")
+    print(f"    hand->peg  {hand_peg_distance(o0):.4f} -> {hand_peg_distance(oh):.4f}")
+    print(f"    peg->goal  {peg_goal_distance(o0):.4f} -> {peg_goal_distance(oh):.4f}")
+    if roll["success_step"] is None:
+        print(f"    no success in {len(roll['obs'])} steps"
+              + ("  (expected — the failure expert rarely succeeds; the point is "
+                 "what the MODEL predicts while it flounders)"
+                 if args.takeover == "failure" and not args.policy_run
+                 else "  — the policy did NOT recover"))
+    else:
+        print(f"    policy recovered: success at step {roll['success_step']} "
+              f"({roll['success_step'] - ho} steps after handover)")
+
+    if args.probe:
+        print("\n(--probe: no video rendered)")
+        return 0
+
+    combos = args.models or sorted(stage2["combos"])
+    missing = [c for c in combos if c not in stage2["combos"]]
+    if missing:
+        raise SystemExit(f"ERROR: {missing} not in {args.t2s_run}; "
+                         f"available: {sorted(stage2['combos'])}")
+
+    out_dir = args.out or os.path.join(eval_dir, "videos")
+    os.makedirs(out_dir, exist_ok=True)
+    tag = args.drive.replace(":", "").replace(",", "_")
+
+    print(f"\n=== filming {len(combos)} model(s) -> {out_dir} ===")
+    rows = {}
+    predictors = {}
+    for combo in combos:
+        fn = load_t2s_predictor(t2s_dir, *combo.rsplit("_", 1),
+                                            seed=stage2["combos"][combo]["best_seed"])
+        predictors[combo] = fn
+        rows[combo] = render_phased(
+            roll, fn, os.path.join(out_dir, f"drive_{tag}_{combo}.mp4"),
+            combo, args.reward_mode, gamma, fps)
+
+    if len(predictors) > 1:
+        t2s_video.render_model_comparison_video(
+            roll, predictors, save_path=os.path.join(out_dir, f"drive_{tag}_ALL.mp4"), fps=fps)
+        print(f"  drive_{tag}_ALL.mp4  every model on the same frames")
+
+    # ---- the table this script exists for --------------------------------
+    actual = rows[combos[0]]["actual_steps_after_handover"]
+    if actual is None:
+        # no ground truth exists, so score what CAN be scored without it: did
+        # the prediction rise as the arm was driven away, and how low did it
+        # fall while the takeover policy failed to solve anything. A low
+        # minimum here is the model's most confident false claim.
+        print(f"\n{'combo':<24}{'pred@start':>11}{'pred@handover':>15}{'rose?':>7}"
+              f"{'min pred':>10}{'verdict':>26}")
+        print("-" * 93)
+        for c in sorted(combos,
+                        key=lambda c: -(rows[c].get("pred_min_after_handover") or 0)):
+            r = rows[c]
+            lo = r.get("pred_min_after_handover")
+            v = ("falsely optimistic" if lo is not None and lo < 30 else "stays pessimistic")
+            print(f"{c:<24}{r['pred_at_start']:>11.1f}{r['pred_at_handover']:>15.1f}"
+                  f"{('yes' if r['rose_during_drive'] else 'NO'):>7}"
+                  f"{(f'{lo:.1f}' if lo is not None else '--'):>10}{v:>26}")
+        print("\nno success occurred, so there is no 'actual steps left' to compare")
+        print("against. LOW min pred on a trajectory that never succeeds is the")
+        print("failure this whole project is about.")
+        with open(os.path.join(out_dir, f"drive_{tag}_index.json"), "w") as f:
+            json.dump(dict(drive=args.drive, handover=ho, seed=args.seed,
+                           takeover=args.takeover, reward_mode=args.reward_mode,
+                           gamma=gamma, success_step=None, models=rows), f, indent=2)
+        return 0
+    print(f"\n{'combo':<24}{'pred@start':>11}{'pred@handover':>15}{'rose?':>7}"
+          f"{'actual left':>13}{'error':>9}")
+    print("-" * 79)
+    for c in sorted(combos, key=lambda c: abs(
+            (rows[c]["pred_at_handover"] - actual) if actual is not None else 0)):
+        r = rows[c]
+        err = (f"{r['pred_at_handover'] - actual:+.1f}" if actual is not None else "--")
+        print(f"{c:<24}{r['pred_at_start']:>11.1f}{r['pred_at_handover']:>15.1f}"
+              f"{('yes' if r['rose_during_drive'] else 'NO'):>7}"
+              f"{(str(actual) if actual is not None else '--'):>13}{err:>9}")
+
+    print("\npred@handover vs actual left is the only check in this pipeline where a")
+    print("prediction meets an unrehearsed outcome — the drive put the arm somewhere")
+    print("no training trajectory went, so nothing here was memorised.")
+    print("'rose? NO' means the prediction did not increase while the arm was driven")
+    print("AWAY from success: that model is reading familiarity, not distance.")
+
+    with open(os.path.join(out_dir, f"drive_{tag}_index.json"), "w") as f:
+        json.dump(dict(drive=args.drive, handover=ho, seed=args.seed,
+                       reward_mode=args.reward_mode, gamma=gamma,
+                       success_step=roll["success_step"],
+                       actual_steps_after_handover=actual, models=rows), f, indent=2)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
