@@ -7,13 +7,22 @@ from stage_2_t2s_training.t2s_io import load_normalization, checkpoint_name
 class T2SModel(nn.Module):
     """Encoder + T2S regression head. Softplus output, so predictions are >= 0."""
 
-    def __init__(self, obs_dim, hidden=256, dropout=0.2):
+    def __init__(self, obs_dim, hidden=256, dropout=0.2, head="linear"):
+        
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(dropout),
         )
-        self.t2s_head = nn.Sequential(nn.Linear(hidden, 1), nn.Softplus())
+        
+        # self.t2s_head = nn.Sequential(nn.Linear(hidden, 1), nn.Softplus())
+        
+        layers = [nn.Linear(hidden, 1)]
+        if head == "softplus":
+            layers.append(nn.Softplus())
+        # Sequential kept so state_dict keys (t2s_head.0.*) match old checkpoints
+        self.t2s_head = nn.Sequential(*layers)
+        self.head = head
 
     def forward(self, x):
         return self.t2s_head(self.encoder(x)).squeeze(-1)

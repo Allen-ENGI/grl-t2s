@@ -58,7 +58,7 @@ CENSOR_SCHEMES = ("censor", "bootstrap")
 
 
 
-MAX_PEG_DISTANCE = 0.08   # metres from the fixed start; None = use every random position
+MAX_PEG_DISTANCE = None #0.08   # metres from the fixed start; None = use every random position
 
 def load_and_prepare(dataset_path, censor_label=CENSOR_LABEL, confirm_buffer=CONFIRM_BUFFER,
                      censor_bootstrap=False):
@@ -292,8 +292,12 @@ def train_one(prepared, method, condition, run_dir, seed=0, gamma=CENSOR_GAMMA,
         pair_mean = pair_sum / n_pair if n_pair else float("nan")
         hist.append((ep, val_mse, val_mse_succ, pred_fail, val_mse_succ_raw, td_mean, pair_mean))
 
-        if val_mse < best:
-            best, stale = val_mse, 0
+
+        # if val_mse < best:
+        if val_mse_succ < best:
+            # best, stale = val_mse, 0
+            best, stale = val_mse_succ, 0
+
             torch.save(model.state_dict(), ckpt_path)
         else:
             stale += 1
@@ -356,7 +360,10 @@ def run_all_combos(run_dir, dataset_path, methods=METHODS, conditions=CONDITIONS
                     target_clip=target_clip, device=device, gamma=gamma,
                     censor_bootstrap=boot)
                 
-                at = int(np.argmin(hist[:, 1]))          # the epoch that was saved
+                # at = int(np.argmin(hist[:, 1]))          # the epoch that was saved
+                
+                at = int(np.argmin(hist[:, 2]))          # the epoch that was saved
+
                 np.save(os.path.join(run_dir, f"{combo}_hist.npy"), hist)
                 models[combo] = model
                 histories[combo] = hist
